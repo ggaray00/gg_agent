@@ -1,0 +1,44 @@
+[project]
+name = "gg-agent"
+version = "0.1.0"
+description = "Bare-bones reconstruction of hermes-agent's core: provider profiles, transports, tool registry, agentic loop, subagents."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "anthropic>=0.40",
+    "mcp>=1.2",
+]
+
+[project.scripts]
+gg-agent = "gg_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gg_agent*"]
+
+# `uv run <name>` shortcuts — see README.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+# Tools hand errors back to the MODEL rather than raising, so broad excepts around
+# tool/credential/IO boundaries are deliberate (see tools/registry.dispatch).
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are written compactly on purpose (dense asserts, inline setup).
+"tests/*" = ["E401", "E702", "B011", "F841"]
