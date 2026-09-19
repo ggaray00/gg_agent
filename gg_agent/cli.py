@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import json
 import logging
+import os
 import sys
+from pathlib import Path
 
 from .agent import Agent, resolve_provider
+from .aio import run_sync
 from .providers import list_providers
 from .tools.registry import discover_builtin_tools, registry
 
@@ -38,6 +43,15 @@ def make_renderer(verbose: bool):
             print(f"{indent}⚠️  {payload['error']} — retrying in {payload['delay']:.1f}s", file=sys.stderr)
         elif kind == "mcp_server":
             print(f"{indent}🔌 mcp/{payload['server']}: {payload['status']}", file=sys.stderr)
+        elif kind == "persist_error":
+            if payload.get("stage") == "open":
+                print(f"{indent}⚠️  database unreachable, running without persistence: {payload['error']}",
+                      file=sys.stderr)
+            elif payload.get("stage") == "owner":
+                print(f"{indent}⚠️  not saving sessions: {payload['error']} — sign in again with "
+                      "--signin EMAIL", file=sys.stderr)
+            else:
+                print(f"{indent}⚠️  persistence ({payload.get('stage')}): {payload['error']}", file=sys.stderr)
     return render
 
 
@@ -63,7 +77,145 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Connect MCP servers from .mcp.json (or the given config file).")
     p.add_argument("--list-mcp", action="store_true",
                    help="Connect the configured MCP servers, list their tools, and exit.")
+    # Persistence (on when GG_DATABASE_URL is set).
+    p.add_argument("--resume", metavar="ID", help="Continue a saved session by id.")
+    p.add_argument("--continue", dest="continue_", action="store_true",
+                   help="Continue the most recent session in this directory.")
+    p.add_argument("--sessions", action="store_true", help="List recent sessions and exit.")
+    p.add_argument("--search", metavar="QUERY", help="Search past sessions and exit.")
+    p.add_argument("--no-persist", action="store_true", help="Don't save this session.")
+    # Users: every saved session has an owner.
+    p.add_argument("--register", metavar="EMAIL", help="Create a user (prompts for a password) and sign in.")
+    p.add_argument("--signin", metavar="EMAIL", help="Sign in as an existing user.")
+    p.add_argument("--signout", action="store_true", help="Forget the signed-in user on this machine.")
+    p.add_argument("--whoami", action="store_true", help="Show the signed-in user.")
     return p
+
+
+# ── Signed-in user ──────────────────────────────────────────────────────────
+# Just "who am I" for this machine: the user_id and email, no password and no
+# token. The password is checked against the database at --signin / --register.
+
+def _account_file() -> Path:
+    return Path(os.getenv("GG_HOME") or Path.home() / ".gg_agent") / "user.json"
+
+
+def _load_account() -> dict | None:
+    try:
+        account = json.loads(_account_file().read_text())
+    except (OSError, ValueError):
+        return None
+    return account if isinstance(account, dict) and account.get("user_id") else None
+
+
+def _save_account(user) -> None:
+    path = _account_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"user_id": user.id, "email": user.email}))
+    path.chmod(0o600)
+
+
+def _read_password(confirm: bool) -> str | None:
+    password = getpass.getpass("Password: ")
+    if confirm and getpass.getpass("Repeat password: ") != password:
+        print("error: passwords don't match", file=sys.stderr)
+        return None
+    return password
+
+
+async def _cmd_register(email: str, password: str) -> int:
+    from .persistence.users import register_user
+
+    async def do(store):
+        user = await register_user(store, email, password)
+        _save_account(user)
+        print(f"registered and signed in as {user.email} (user_id {user.id})", file=sys.stderr)
+    return await _with_default_store(do)
+
+
+async def _cmd_signin(email: str, password: str) -> int:
+    from .persistence.users import authenticate
+
+    async def do(store):
+        user = await authenticate(store, email, password)
+        if user is None:
+            raise ValueError("wrong email or password")
+        _save_account(user)
+        print(f"signed in as {user.email} (user_id {user.id})", file=sys.stderr)
+    return await _with_default_store(do)
+
+
+def _cmd_account(args) -> int:
+    if args.signout:
+        _account_file().unlink(missing_ok=True)
+        print("signed out", file=sys.stderr)
+        return 0
+    account = _load_account()                           # --whoami
+    print(f"{account['email']} (user_id {account['user_id']})" if account else "not signed in")
+    return 0 if account else 1
+
+
+# ── Sessions ────────────────────────────────────────────────────────────────
+
+def _print_sessions(sessions, current: str | None = None) -> None:
+    if not sessions:
+        print("no sessions yet", file=sys.stderr)
+    for info in sessions:
+        when = info.last_activity_at.strftime("%Y-%m-%d %H:%M") if info.last_activity_at else "?"
+        mark = "*" if info.id == current else " "
+        print(f"{mark} {info.id}  {when}  {info.message_count:>4} msgs  {info.title or '(untitled)'}")
+
+
+def _print_hits(hits) -> None:
+    if not hits:
+        print("no matches", file=sys.stderr)
+    for hit in hits:
+        snippet = " ".join((hit.snippet or "").split())
+        print(f"{hit.session_id}  #{hit.message_id:<6} {hit.role:<9} {snippet}")
+
+
+async def _with_default_store(fn, *, need_account: bool = False) -> int:
+    """Open the $GG_DATABASE_URL store, run ``fn(store)``, close it.
+    A ValueError from ``fn`` is a user-facing error, printed and returned as 2."""
+    from .persistence import get_default_store
+
+    if need_account and _load_account() is None:
+        print("error: not signed in — use --signin EMAIL or --register EMAIL.", file=sys.stderr)
+        return 2
+    store = get_default_store()
+    if store is None:
+        print("error: persistence is not configured — set GG_DATABASE_URL.", file=sys.stderr)
+        return 2
+    try:
+        await store.open()
+    except Exception as exc:
+        print(f"error: database unreachable: {exc}", file=sys.stderr)
+        return 1
+    try:
+        await fn(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        await store.close()
+    return 0
+
+
+async def _cmd_sessions() -> int:
+    async def show(store):
+        _print_sessions(await store.list_sessions(limit=20, owner_id=_load_account()["user_id"]))
+    return await _with_default_store(show, need_account=True)
+
+
+async def _cmd_search(query: str) -> int:
+    async def show(store):
+        _print_hits(await store.search(query, limit=20, owner_id=_load_account()["user_id"]))
+    return await _with_default_store(show, need_account=True)
+
+
+async def _latest_session_id(agent: Agent) -> str | None:
+    sessions = await agent.store.list_sessions(limit=1, cwd=agent.cwd, owner_id=agent.user_id)
+    return sessions[0].id if sessions else None
 
 
 def _cmd_login(provider: str) -> int:
@@ -172,12 +324,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_mcp:
         return asyncio.run(_cmd_list_mcp(args.mcp if args.mcp is not True else None))
 
+    if args.register or args.signin:
+        password = _read_password(confirm=bool(args.register))
+        if password is None:
+            return 2
+        if args.register:
+            return asyncio.run(_cmd_register(args.register, password))
+        return asyncio.run(_cmd_signin(args.signin, password))
+
+    if args.signout or args.whoami:
+        return _cmd_account(args)
+
+    if args.sessions:
+        return asyncio.run(_cmd_sessions())
+
+    if args.search:
+        return asyncio.run(_cmd_search(args.search))
+
     if args.list_tools:
         discover_builtin_tools()
         for name in registry.all_names():
             entry = registry.get(name)
             print(f"{entry.emoji} {name:<16} [{entry.toolset}] {entry.description.splitlines()[0][:80]}")
         return 0
+
+    account = _load_account()
+    wants_persistence = bool(os.getenv("GG_DATABASE_URL", "").strip()) and not args.no_persist
+    if wants_persistence and account is None:
+        if args.resume or args.continue_:
+            print("error: not signed in — use --signin EMAIL first.", file=sys.stderr)
+            return 2
+        print("⚠️  not signed in, so this session won't be saved "
+              "(gg-agent --register EMAIL, or --signin EMAIL)", file=sys.stderr)
 
     try:
         agent = Agent(
@@ -189,12 +367,30 @@ def main(argv: list[str] | None = None) -> int:
             max_iterations=args.max_iterations,
             max_depth=args.max_depth,
             event_callback=make_renderer(args.verbose),
+            store=None if wants_persistence and account else False,
+            user_id=account["user_id"] if account else None,
+            resume=args.resume,
         )
+        # Open the store up front: an unreachable DB is reported (and persistence
+        # switched off) before the first prompt, and --resume fails fast.
+        persisting = run_sync(agent.astart())
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    print(f"[{agent.profile.name}/{agent.model} · {len(agent.tool_definitions())} tools]", file=sys.stderr)
+    if args.continue_:
+        latest = run_sync(_latest_session_id(agent)) if persisting else None
+        if latest:
+            agent.resume(latest)
+        else:
+            print("no previous session to continue here; starting a new one", file=sys.stderr)
+
+    banner = f"[{agent.profile.name}/{agent.model} · {len(agent.tool_definitions())} tools"
+    if persisting:
+        banner += f" · {account['email']} · session {agent.session_id}"
+        if agent.history:
+            banner += f" (resumed, {len(agent.history)} messages)"
+    print(banner + "]", file=sys.stderr)
 
     with agent:
         if args.prompt:
@@ -216,8 +412,43 @@ def _print_footer(result: dict) -> None:
           f"{result['duration_seconds']}s · {result['exit_reason']}]", file=sys.stderr)
 
 
+def _repl_session_command(agent: Agent, line: str) -> bool:
+    """Handle /sessions, /resume, /new, /search. Returns False if it wasn't one."""
+    command, _, arg = line.partition(" ")
+    arg = arg.strip()
+    if command not in {"/sessions", "/resume", "/new", "/search"}:
+        return False
+    if agent.store is None:
+        print("persistence is off (set GG_DATABASE_URL)", file=sys.stderr)
+        return True
+    try:
+        if command == "/sessions":
+            _print_sessions(run_sync(agent.store.list_sessions(limit=20, owner_id=agent.user_id)),
+                            current=agent.session_id)
+        elif command == "/search":
+            if not arg:
+                print("usage: /search QUERY", file=sys.stderr)
+            else:
+                _print_hits(run_sync(agent.store.search(arg, limit=20, owner_id=agent.user_id)))
+        elif command == "/resume":
+            if not arg:
+                print("usage: /resume ID", file=sys.stderr)
+            else:
+                agent.resume(arg)
+                print(f"resumed {agent.session_id} ({len(agent.history)} messages)", file=sys.stderr)
+        else:
+            agent.reset()
+            print(f"new session {agent.session_id}", file=sys.stderr)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+    return True
+
+
 def _repl(agent: Agent) -> int:
-    print("Type a task, or /reset, /history, /exit.", file=sys.stderr)
+    help_text = "Type a task, or /reset, /history, /exit."
+    if agent.store is not None:
+        help_text = "Type a task, or /new, /sessions, /resume ID, /search QUERY, /history, /exit."
+    print(help_text, file=sys.stderr)
     while True:
         try:
             line = input("\n› ").strip()
@@ -230,7 +461,10 @@ def _repl(agent: Agent) -> int:
             return 0
         if line == "/reset":
             agent.reset()
-            print("history cleared", file=sys.stderr)
+            print("history cleared" + (f" · new session {agent.session_id}" if agent.store else ""),
+                  file=sys.stderr)
+            continue
+        if _repl_session_command(agent, line):
             continue
         if line == "/history":
             print(f"{len(agent.history)} messages", file=sys.stderr)

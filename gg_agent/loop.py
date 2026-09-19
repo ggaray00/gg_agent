@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,6 +57,10 @@ class LoopState:
     # Per-iteration slots, rebound by the phases before any later phase reads them.
     api_kwargs: dict[str, Any] | None = None
     response: NormalizedResponse | None = None
+    # Persistence: a callback that makes messages durable, and the index into
+    # ``messages`` of the first one it hasn't accepted yet.
+    persist: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None
+    persisted_upto: int = 0
 
 
 # ── Phase 1: assemble the request ────────────────────────────────────────────
@@ -190,20 +195,57 @@ async def run_tool_round(agent, s: LoopState, response: NormalizedResponse) -> N
     s.tool_calls_made += len(calls)
 
 
+# ── Persistence ──────────────────────────────────────────────────────────────
+
+async def flush(agent, s: LoopState) -> None:
+    """Hand the not-yet-durable tail of the transcript to ``s.persist``.
+
+    A failure is logged and reported, never raised: losing the transcript is bad,
+    losing the turn as well is worse. ``persisted_upto`` only advances on success,
+    so the same tail is offered again at the next flush point.
+
+    Index-based dedup is sound only because history is append-only. Compression
+    or rewind would need hermes's per-message marker (agent/session_persistence.py).
+    """
+    end = len(s.messages)
+    if s.persist is None or s.persisted_upto >= end:
+        return
+    pending = [m for m in s.messages[s.persisted_upto:end] if m.get("role") != "system"]
+    try:
+        if pending:
+            await s.persist(pending)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        agent._persist_error("append", exc, pending=len(pending))
+        return
+    s.persisted_upto = end
+
+
 # ── The loop itself ──────────────────────────────────────────────────────────
 
 async def run_conversation(agent, user_message: str,
                            conversation_history: list[dict[str, Any]] | None = None,
-                           system_prompt: str | None = None) -> dict[str, Any]:
-    """Run one user turn to completion. Returns the result dict the caller keeps."""
+                           system_prompt: str | None = None,
+                           persist: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
+                           persisted_history: int | None = None) -> dict[str, Any]:
+    """Run one user turn to completion. Returns the result dict the caller keeps.
+
+    ``persist`` makes messages durable (the loop knows nothing about stores).
+    ``persisted_history`` says how many of ``conversation_history`` already are —
+    all of them unless an earlier turn's flush failed.
+    """
+    history_in = conversation_history or []
     messages: list[dict[str, Any]] = []
     system = system_prompt or agent.system_prompt
     if system:
         messages.append({"role": "system", "content": system})
-    messages.extend(conversation_history or [])
+    messages.extend(history_in)
     messages.append({"role": "user", "content": user_message})
 
-    s = LoopState(messages=messages)
+    offset = 1 if system else 0
+    durable = len(history_in) if persisted_history is None else min(persisted_history, len(history_in))
+    s = LoopState(messages=messages, persist=persist, persisted_upto=offset + durable)
     started = time.time()
 
     while s.api_call_count < agent.max_iterations:
@@ -222,9 +264,13 @@ async def run_conversation(agent, user_message: str,
             s.usage = s.usage + response.usage
 
         record_assistant_message(s, response)
+        # Durable BEFORE any tool runs: a crash mid-round leaves a transcript that
+        # resume can repair, instead of tool side effects with no record of the ask.
+        await flush(agent, s)
 
         if response.tool_calls:
             await run_tool_round(agent, s, response)
+            await flush(agent, s)
             continue                        # back to the model with the results
 
         # No tool calls: this text is the answer.
@@ -238,6 +284,10 @@ async def run_conversation(agent, user_message: str,
                             or f"[stopped after {agent.max_iterations} iterations without a final answer]")
 
     # ── Finalize ─────────────────────────────────────────────────────────
+    # Catches the exits that skip the flush points (interrupt, API error, iteration
+    # cap) and retries anything an earlier flush failed to write.
+    await flush(agent, s)
+
     # The history handed back EXCLUDES the system message: the next turn rebuilds
     # it, so a prompt change takes effect immediately instead of being pinned by
     # a stale copy in the transcript.
@@ -252,4 +302,6 @@ async def run_conversation(agent, user_message: str,
         "interrupted": s.interrupted,
         "failed": s.failed,
         "exit_reason": s.exit_reason,
+        # How many entries of ``history`` are durable (== len(history) unless a flush failed).
+        "persisted": max(0, s.persisted_upto - offset),
     }

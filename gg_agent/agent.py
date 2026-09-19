@@ -10,7 +10,11 @@ The sync ``run`` / ``ask`` / ``close`` are thin wrappers over a background event
 loop (see ``gg_agent.aio``) so scripts and tests need no ceremony. Calling a sync
 one from inside a running loop raises rather than deadlocking.
 
+Persistence is opt-in and lives behind ``self.store`` (see ``gg_agent.persistence``).
+With no store the agent behaves exactly as if persistence did not exist.
+
 Mirrors hermes-agent: run_agent.AIAgent + agent/agent_init.py + agent/client_lifecycle.py
++ agent/session_persistence.py
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 
 from .aio import run_sync
 from .loop import run_conversation
+from .persistence import SUBAGENT_SOURCE, SessionStore, get_default_store
 from .prompts import build_system_prompt
 from .providers import ProviderProfile, get_provider_profile, iter_configured
 from .tools.registry import discover_builtin_tools, registry
@@ -34,6 +39,8 @@ logger = logging.getLogger(__name__)
 # A leaf subagent must not delegate further, or a bad prompt can fork-bomb the
 # machine. Depth, not the model, decides who gets this tool back.
 DELEGATE_BLOCKED_TOOLS = {"delegate_task"}
+# Subagents work from the context they were handed, not from past sessions.
+SUBAGENT_BLOCKED_TOOLS = {"session_search"}
 
 
 def resolve_provider(name: str | None = None) -> ProviderProfile:
@@ -77,6 +84,15 @@ class Agent:
         # or a list of MCPServerConfig. Connection happens on the first turn,
         # because __init__ is sync and connecting is not.
         mcp: bool | str | os.PathLike | list | None = None,
+        # Persistence: None = $GG_DATABASE_URL if set (else off), False = off,
+        # or a SessionStore. Every session has an owner, so it also needs the
+        # ``user_id`` of a registered user (see persistence/users.py) — without
+        # one nothing is saved. ``resume`` loads one of that user's sessions on
+        # the first turn (or call ``astart()`` to load it now).
+        store: SessionStore | bool | None = None,
+        user_id: str | None = None,
+        resume: str | None = None,
+        source: str = "cli",
         # Delegation lineage — set by the delegate tool, not by users.
         depth: int = 0,
         max_depth: int = 2,
@@ -102,11 +118,38 @@ class Agent:
 
         self.session_id = uuid.uuid4().hex[:12]
         self.cwd = os.path.abspath(cwd) if cwd else os.getcwd()
-        self.system_prompt = system_prompt or build_system_prompt(extra_instructions, cwd=self.cwd)
 
         self.registry = registry
         self.enabled_toolsets = enabled_toolsets
         self.blocked_tools = set(blocked_tools or ())
+
+        # A child shares its parent's store (and so its pool); only whoever
+        # created the store from the environment closes it.
+        self._owns_store = False
+        if store is False:
+            store = None
+        elif store is None or store is True:
+            if parent is not None:
+                store = parent.store
+            else:
+                store = get_default_store()
+                self._owns_store = store is not None
+        # Subagents act for the same user as their parent.
+        self.user_id = user_id if user_id is not None else (parent.user_id if parent else None)
+        self._persistence_off_reason: str | None = None
+        if store is not None and self.user_id is None:
+            store, self._owns_store = None, False
+            self._persistence_off_reason = "no user_id given, so sessions have no owner and are not saved"
+        self.store: SessionStore | None = store
+        self.source = SUBAGENT_SOURCE if parent is not None and source == "cli" else source
+        self._pending_resume = resume
+        self._store_ready = False
+        self._session_created = False
+        self._persisted_len = 0              # how many of self.history are durable
+        self._sessions_to_end: list[str] = []
+
+        self.system_prompt = system_prompt or build_system_prompt(
+            extra_instructions, cwd=self.cwd, session_search=self._session_search_enabled())
 
         self.max_iterations = max_iterations
         self.event_callback = event_callback
@@ -185,15 +228,121 @@ class Agent:
             self._emit("mcp_server", server=name, status=state)
         return status
 
+    # ── Persistence ──────────────────────────────────────────────────────
+
+    async def astart(self) -> bool:
+        """Open the store (and load ``resume``) now instead of on the first turn.
+
+        Returns whether persistence is active. An unreachable database disables
+        persistence with a ``persist_error`` event rather than raising — except
+        when resuming, where the transcript is the whole point: that raises.
+        """
+        if self.store is None:
+            reason, self._persistence_off_reason = self._persistence_off_reason, None
+            if self._pending_resume:
+                raise RuntimeError(f"cannot resume {self._pending_resume}: " + (
+                    reason or "persistence is not enabled (set GG_DATABASE_URL or pass store=)"))
+            if reason:                                   # reported once
+                self._persist_error("owner", RuntimeError(reason))
+            return False
+        if not self._store_ready:
+            self._store_ready = True
+            try:
+                await self.store.open()
+                # Checked up front (root agents only — children share the parent's
+                # user): otherwise every session insert would fail on the foreign key.
+                if self.parent is None and await self.store.get_user(self.user_id) is None:
+                    raise LookupError(f"user {self.user_id!r} does not exist in this database")
+            except Exception as exc:
+                if self._pending_resume:
+                    raise RuntimeError(f"cannot resume {self._pending_resume}: {exc}") from exc
+                self._persist_error("owner" if isinstance(exc, LookupError) else "open", exc)
+                if self._owns_store:
+                    try:
+                        await self.store.close()
+                    except Exception:
+                        logger.debug("store close failed", exc_info=True)
+                self.store = None
+                return False
+            if self._pending_resume:
+                session_id, self._pending_resume = self._pending_resume, None
+                await self._load_session(session_id)
+        return self.store is not None
+
+    async def aresume(self, session_id: str) -> None:
+        """Switch this agent to an earlier session: its id, its transcript."""
+        if not await self.astart():
+            raise RuntimeError("persistence is not enabled (set GG_DATABASE_URL or pass store=)")
+        await self._flush_ended_sessions()
+        await self._load_session(session_id)
+
+    def resume(self, session_id: str) -> None:
+        run_sync(self.aresume(session_id))
+
+    async def _load_session(self, session_id: str) -> None:
+        info = await self.store.get_session(session_id)
+        # Someone else's session looks exactly like a missing one: no leaking ids.
+        if info is None or info.owner_id != self.user_id:
+            raise ValueError(f"No such session {session_id!r}")
+        if self._session_created and self.session_id != session_id:
+            self._sessions_to_end.append(self.session_id)
+        self.session_id = session_id
+        self.history = await self.store.load_history(session_id)
+        self._persisted_len = len(self.history)
+        self._session_created = True
+
+    async def _ensure_session(self, *, raise_errors: bool = False) -> None:
+        """Create this session's row, once. Retried on every flush until it lands."""
+        if self._session_created or self.store is None:
+            return
+        try:
+            await self.store.create_session(
+                self.session_id, owner_id=self.user_id, source=self.source,
+                provider=self.profile.name, model=self.model,
+                system_prompt=self.system_prompt, cwd=self.cwd,
+                parent_session_id=self.parent.session_id if self.parent else None)
+            self._session_created = True
+        except Exception as exc:
+            if raise_errors:
+                raise
+            self._persist_error("create", exc)
+
+    async def _persist(self, messages: list[dict[str, Any]]) -> None:
+        await self._ensure_session(raise_errors=True)
+        await self.store.append_messages(self.session_id, messages)
+
+    async def _flush_ended_sessions(self) -> None:
+        """End sessions left behind by the sync ``reset()``, which can't await."""
+        while self._sessions_to_end and self.store is not None:
+            session_id = self._sessions_to_end.pop(0)
+            try:
+                await self.store.end_session(session_id, "new_session")
+            except Exception as exc:
+                self._persist_error("end", exc)
+
+    def _persist_error(self, stage: str, exc: BaseException, **extra: Any) -> None:
+        """Report a persistence failure once: as an event when someone listens
+        (the CLI prints those), as a log warning when nobody does."""
+        if self.event_callback is None:
+            logger.warning("persistence %s failed for session %s: %s", stage, self.session_id, exc)
+        else:
+            logger.debug("persistence %s failed for session %s", stage, self.session_id, exc_info=exc)
+        self._emit("persist_error", stage=stage, error=str(exc), **extra)
+
     # ── Tool grant ───────────────────────────────────────────────────────
 
     def tool_definitions(self) -> list[dict]:
         """Schemas this agent is allowed to use. The subagent restriction is
         exactly this call with a different filter — nothing deeper."""
+        blocked = self.blocked_tools if self.store is not None else self.blocked_tools | {"session_search"}
         return self.registry.get_definitions(
             enabled_toolsets=self.enabled_toolsets,
-            blocked_tools=self.blocked_tools,
+            blocked_tools=blocked,
         )
+
+    def _session_search_enabled(self) -> bool:
+        return (self.store is not None and "session_search" not in self.blocked_tools
+                and (self.enabled_toolsets is None or "sessions" in self.enabled_toolsets))
 
     def can_delegate(self) -> bool:
         return self.depth < self.max_depth and "delegate_task" not in self.blocked_tools
@@ -229,10 +378,25 @@ class Agent:
         """Run one turn. ``keep_history=False`` gives a stateless one-shot call."""
         if self.mcp and not self._mcp_connected:
             await self.connect_mcp()
+        # A stateless one-shot is not part of the session, so it isn't recorded.
+        persisting = keep_history and await self.astart()
+        if persisting:
+            await self._flush_ended_sessions()
+            await self._ensure_session()
         await self.refresh_credentials()
-        result = await run_conversation(self, user_message, conversation_history=self.history)
+        result = await run_conversation(
+            self, user_message, conversation_history=self.history,
+            persist=self._persist if persisting else None,
+            persisted_history=self._persisted_len if persisting else None)
         if keep_history:
             self.history = result["history"]
+            self._persisted_len = result["persisted"] if persisting else len(self.history)
+        if persisting and self._session_created:
+            usage = result["usage"]
+            try:
+                await self.store.add_usage(self.session_id, usage.prompt_tokens, usage.completion_tokens)
+            except Exception as exc:
+                self._persist_error("usage", exc)
         return result
 
     async def aask(self, user_message: str, **kwargs) -> str:
@@ -247,7 +411,15 @@ class Agent:
         return run_sync(self.aask(user_message, **kwargs))
 
     def reset(self) -> None:
+        """Clear the conversation. With a store, that means a NEW session; the old
+        one is ended on the next turn or at close (this method is sync)."""
         self.history = []
+        self._persisted_len = 0
+        if self.store is not None:
+            if self._session_created:
+                self._sessions_to_end.append(self.session_id)
+            self.session_id = uuid.uuid4().hex[:12]
+            self._session_created = False
 
     # ── Teardown ─────────────────────────────────────────────────────────
 
@@ -258,6 +430,19 @@ class Agent:
             await self.transport.aclose_client(self.client)
         except Exception:
             logger.debug("client close failed", exc_info=True)
+        if self.store is not None and self._store_ready:
+            await self._flush_ended_sessions()
+            if self._session_created:
+                try:
+                    await self.store.end_session(self.session_id, "closed")
+                except Exception as exc:
+                    self._persist_error("end", exc)
+            if self._owns_store:
+                try:
+                    await self.store.close()
+                except Exception:
+                    logger.debug("store close failed", exc_info=True)
+                self._store_ready = False
 
     def close(self) -> None:
         run_sync(self.aclose())

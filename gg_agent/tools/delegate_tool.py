@@ -41,13 +41,13 @@ MAX_SUMMARY_CHARS = 8_000
 
 def _build_child(parent_agent, task: dict[str, Any], index: int):
     """Build (don't run) one child agent on the calling thread."""
-    from ..agent import DELEGATE_BLOCKED_TOOLS, Agent
+    from ..agent import DELEGATE_BLOCKED_TOOLS, SUBAGENT_BLOCKED_TOOLS, Agent
 
     child_depth = parent_agent.depth + 1
     # A child may delegate only while there is depth left beneath it. Capability is
     # depth-derived — the model never gets to ask for it.
     can_delegate = child_depth < parent_agent.max_depth
-    blocked = set(parent_agent.blocked_tools)
+    blocked = set(parent_agent.blocked_tools) | SUBAGENT_BLOCKED_TOOLS
     if not can_delegate:
         blocked |= DELEGATE_BLOCKED_TOOLS
 
@@ -74,6 +74,10 @@ def _build_child(parent_agent, task: dict[str, Any], index: int):
         depth=child_depth,
         max_depth=parent_agent.max_depth,
         parent=parent_agent,
+        # Same store (and pool) as the parent; the parent link supplies
+        # parent_session_id, so a child transcript is traceable but hidden by default.
+        store=parent_agent.store if parent_agent.store is not None else False,
+        source="subagent",
     )
     child._task_index = index
     return child

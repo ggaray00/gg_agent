@@ -19,7 +19,7 @@ uv run gg-agent --list-providers --list-tools
 uv run gg-agent --list-models            # live catalog for the active provider
 uv run python example_subagents.py       # delegation, two ways
 
-uv run pytest                            # 26 offline tests, no keys needed
+uv run pytest                            # 73 offline tests, no keys or database needed
 uv run ruff check gg_agent/
 ```
 
@@ -129,6 +129,13 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | `agent.py` | `Agent`: provider resolution, client, tool grant, interrupts, turn facade | `run_agent.AIAgent`, `agent/agent_init.py`, `agent/client_lifecycle.py` |
 | `prompts.py` | main + child system prompts | `agent/prompt_builder.py`, `tools/delegate_tool_progress.py` |
 | `cli.py` | one-shot / REPL front-end, event rendering | `cli.py` |
+| `persistence/__init__.py` | `SessionStore` protocol, `SessionInfo` / `SearchHit`, `get_default_store()` | `hermes_state*.py` (the non-SQLite parts) |
+| `persistence/postgres.py` | Postgres store: advisory-locked appends, `tsvector` + trigram search | `hermes_state_messages.py`, `hermes_state_search.py` |
+| `persistence/memory.py` | in-process store with the same contract (tests, embedding) | — |
+| `persistence/serialize.py` | message dict ↔ row, resume repair of a dangling tool round | `hermes_state_messages.py` |
+| `persistence/users.py` | email + password users (stdlib scrypt hashing), register / authenticate | — |
+| `persistence/migrate.py` | numbered `migrations/*.sql`, a `schema_version` table, no Alembic | — |
+| `tools/session_tools.py` | `session_search`: discover / scroll / read / browse past sessions | `tools/session_search_tool.py` |
 
 **The `LoopState` + phase-function shape in `loop.py` is not decoration.** It is exactly
 how hermes scales that loop: each phase (`assemble_request`, `perform_api_call`,
@@ -260,6 +267,105 @@ Three design points:
 
 ---
 
+## Persistence
+
+Off by default. Set `GG_DATABASE_URL`, sign in, and every session is saved to Postgres
+under your user: the transcript, the model and provider, token usage, and which session
+delegated to which. Without it, nothing is written and behaviour is unchanged.
+
+Tables go in their own schema, `gg_agent` by default (`GG_DATABASE_SCHEMA` to change
+it), created on first connect. That lets gg-agent share a database with other apps
+without touching their `users` or `sessions` tables.
+
+It needs a running Postgres server (a local install such as Homebrew `postgresql@16`, or
+any server you can reach), no Docker. One-time setup:
+
+```bash
+createuser gg --pwprompt            # password: gg
+createdb -O gg gg_agent
+createdb -O gg gg_agent_test        # only for `pytest -m pg`
+psql -d gg_agent      -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+psql -d gg_agent_test -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+export GG_DATABASE_URL=postgresql://gg:gg@localhost:5432/gg_agent    # see .env.example
+```
+
+`pg_trgm` is created by a superuser because `gg` may not be allowed to. On a managed
+server where you connect as the admin user (RDS's `postgres`, for example), skip all of
+this: the first connection creates the schema, the extension and the tables
+(`persistence/migrations/*.sql`).
+
+### Users
+
+Every session has an owner. Users are an email plus a password; the password is stored
+only as a salted scrypt hash (`persistence/users.py`, standard library, no new
+dependency).
+
+```bash
+uv run gg-agent --register you@example.com   # prompts for a password (8+ chars), signs you in
+uv run gg-agent --signin you@example.com     # on another machine, or after --signout
+uv run gg-agent --whoami
+uv run gg-agent --signout
+```
+
+Signing in writes your `user_id` and email (never the password) to `~/.gg_agent/user.json`
+(`GG_HOME` moves it). This is identification, not security: anyone who can edit that
+file can act as that user. If you're not signed in, the agent still runs but doesn't save
+anything, and says so.
+
+Everything is scoped to the signed-in user: `--sessions`, `--search`, `--continue`,
+`--resume`, the REPL commands and the model's `session_search`. Another user's session id
+behaves as if it doesn't exist. In code, pass the owner explicitly:
+
+```python
+from gg_agent.persistence.users import register_user, authenticate
+user = await authenticate(store, "you@example.com", password)
+async with Agent(store=store, user_id=user.id) as agent: ...
+```
+
+```bash
+uv run gg-agent --continue "what did I ask first?"   # most recent session in this directory
+uv run gg-agent --resume 3f9c2a1b7d04                # a specific session
+uv run gg-agent --sessions                           # recent sessions
+uv run gg-agent --search '"connection pool" -redis'  # search every transcript
+uv run gg-agent --no-persist "scratch question"      # don't record this one
+```
+
+In the REPL: `/sessions`, `/resume ID`, `/new` (start a fresh session), `/search QUERY`.
+`/reset` also starts a new session. The banner shows the session id so you can come back to it.
+
+```python
+async with Agent(user_id=uid) as agent:                     # store from $GG_DATABASE_URL
+    await agent.arun("...")
+async with Agent(user_id=uid, resume="3f9c2a1b7d04") as agent:   # continue it later
+    ...
+Agent(store=InMemorySessionStore(), user_id=uid)            # any SessionStore; store=False = off
+```
+
+How it behaves:
+
+* **Crash-safe ordering.** Messages are written after each model response, *before* the
+  tools it asked for run, and again after the tool replies land. A process killed
+  mid-tool-round leaves a transcript that `--resume` repairs by dropping the unanswered
+  call. Rows are ordered by their id, never by timestamp.
+* **A database failure never fails a turn.** It is reported once (a `persist_error`
+  event), the in-memory history carries on, and the unsaved messages are retried on the
+  next write. If the database is unreachable at startup, the CLI warns once and runs
+  without persistence.
+* **The model searches, nothing is injected.** With a store, the agent gets a
+  `session_search` tool and one line of system-prompt guidance. Given a query, it returns
+  the best-matching past sessions (the top one with surrounding messages), and it can
+  scroll or read a session by id. It returns only stored messages; no LLM calls.
+  Subagents don't get it.
+* **Subagents** share the parent's connection pool. Their sessions are linked to the
+  parent's and hidden from `--sessions` and search by default.
+
+Search is keyword-only: a `simple`-config `tsvector` (no stemming, which suits code
+identifiers) queried with `websearch_to_tsquery`, so `"phrases"`, `OR` and `-term` work
+and malformed input never errors. When that finds nothing it falls back to a raw
+substring match, backed by the trigram index, for things like paths.
+
+---
+
 ## Adding things
 
 **A provider** (OpenAI-compatible): one `register_provider(ProviderProfile(...))` call in
@@ -280,16 +386,26 @@ so it cannot stall the loop.
 
 ## Tests
 
-No network, no keys, and they never read your real credential store — a scripted fake
-transport drives the real loop:
+No network, no keys, no database, and they never read your real credential store — a
+scripted fake transport drives the real loop:
 
 ```bash
-uv run pytest -q                      # all 38
+uv run pytest -q                      # all 73
 uv run pytest tests/test_loop.py      # loop, tool rounds, ordering, retries, caps
 uv run pytest tests/test_subagents.py # delegation, depth caps, both transports
 uv run pytest tests/test_async.py     # sync wrappers, concurrency, cancellation, dispatch
 uv run pytest tests/test_mcp.py       # config, namespacing, schema translation, failures
 uv run pytest tests/test_copilot_auth.py  # token discovery, exchange, caching, refresh
+uv run pytest tests/test_persistence.py   # store contract, users + ownership, resume repair, loop/Agent
+uv run pytest tests/test_session_search.py  # the four search modes, exclusions, dedup
+```
+
+The store contract also runs against Postgres, along with Postgres-only tests (search
+syntax, the ILIKE fallback, 2MB rows, concurrent writers), when a test database is
+configured. Each test works in a throwaway schema:
+
+```bash
+GG_TEST_DATABASE_URL=postgresql://gg:gg@localhost:5432/gg_agent_test uv run pytest -m pg
 ```
 
 ---
@@ -302,7 +418,9 @@ Roughly in the order worth adding back if you keep going:
 2. **Context compression** — summarize old turns before the window overflows
    (`agent/context_compressor.py`, `trajectory_compressor.py`). Everything else stays
    usable without this; long sessions do not.
-3. **Persistence** — SQLite transcript, resume, search (`hermes_state*.py`, 20+ modules).
+3. **More persistence** — the transcript, resume and keyword search are here (Postgres,
+   above). Still missing: semantic search, per-model cost accounting, LLM-generated titles,
+   and compaction-aware storage (`hermes_state*.py`, 20+ modules).
 4. **Failover & credential pools** — retry onto a fallback model/key on 429/5xx
    (`agent/credential_pool.py`, `agent/error_classifier.py`).
 5. **Approval gates** — confirm before destructive tools run (`tools/write_approval.py`).

@@ -8,6 +8,7 @@ dependencies = [
     "openai>=1.40",
     "anthropic>=0.40",
     "mcp>=1.2",
+    "psycopg[binary,pool]>=3.2",
 ]
 
 [project.scripts]
@@ -19,6 +20,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["gg_agent*"]
+
+[tool.setuptools.package-data]
+"gg_agent.persistence" = ["migrations/*.sql"]
 
 # `uv run <name>` shortcuts — see README.
 [dependency-groups]
@@ -38,6 +42,7 @@ ignore = ["E501", "B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["pg: needs a live Postgres (GG_TEST_DATABASE_URL)"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests are written compactly on purpose (dense asserts, inline setup).

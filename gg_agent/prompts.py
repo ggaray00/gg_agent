@@ -55,9 +55,18 @@ parent. You are responsible for the final summary, not your workers.
 """
 
 
-def build_system_prompt(extra: str = "", cwd: str | None = None) -> str:
+# Added only when the agent actually has the tool (persistence on, tool not blocked).
+SESSION_SEARCH_GUIDANCE = (
+    "- When the user refers to something from a past conversation, or you suspect "
+    "relevant context exists in an earlier session, use session_search to recall it "
+    "before asking them to repeat themselves.\n"
+)
+
+
+def build_system_prompt(extra: str = "", cwd: str | None = None, *, session_search: bool = False) -> str:
     """Main agent prompt + runtime facts the model would otherwise guess at."""
-    parts = [MAIN_SYSTEM_PROMPT, "\n## Environment\n"
+    parts = [MAIN_SYSTEM_PROMPT + (SESSION_SEARCH_GUIDANCE if session_search else ""),
+             "\n## Environment\n"
              f"- Date: {date.today().isoformat()}\n"
              f"- Platform: {platform.system()} {platform.release()}\n"
              f"- Working directory: {cwd or os.getcwd()}\n"]
