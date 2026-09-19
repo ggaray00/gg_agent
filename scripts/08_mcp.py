@@ -11,7 +11,7 @@ server that needs no credentials — it just needs npx on your PATH.
 
 import asyncio
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── edit me ──────────────────────────────────────────────────────────────
 PROVIDER = None
@@ -69,7 +69,7 @@ async def main() -> int:
 
         banner(agent, "mcp")
         result = await agent.arun(PROMPT)
-        print(f"\n{result['response']}")
+        answer(result)
         footer(result)
         return 0
     finally:

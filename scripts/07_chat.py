@@ -8,7 +8,7 @@ this file instead of on a command line, and you can edit them between runs.
     /tools    list the tool grant   /exit   quit (Ctrl-D works too)
 """
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── edit me ──────────────────────────────────────────────────────────────
 PROVIDER = None
@@ -61,7 +61,7 @@ def main() -> int:
                 print("\ninterrupted")
                 agent.clear_interrupt()
                 continue
-            print(f"\n{result['response']}")
+            answer(result)
             footer(result)
 
 

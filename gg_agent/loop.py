@@ -28,6 +28,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .stream_delivery import StreamDelivery
+from .transports.streaming import StreamInterrupted, is_stream_unsupported
 from .transports.types import NormalizedResponse, Usage
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,10 @@ class LoopState:
     # ``messages`` of the first one it hasn't accepted yet.
     persist: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None
     persisted_upto: int = 0
+    # Streaming: what the user has been shown, and whether the final answer was
+    # among it (so a caller that rendered the deltas doesn't print it twice).
+    stream: StreamDelivery | None = None
+    streamed: bool = False
 
 
 # ── Phase 1: assemble the request ────────────────────────────────────────────
@@ -89,14 +95,30 @@ async def perform_api_call(agent, s: LoopState) -> NormalizedResponse | None:
     Retries are the transport's problem only in the sense of *what* to re-send;
     *whether* to retry is a loop decision, which is why the SDK clients are all
     built with ``max_retries=0``.
+
+    Streaming changes the retry rules, because text on screen can't be taken back:
+      * an endpoint that rejects streaming switches it off and retries — free;
+      * a failure AFTER text was shown is not retried (it would repeat the text):
+        the partial answer is kept as the response, ``finish_reason="length"``;
+        the exception is a drop mid tool-call, which is retried with a notice;
+      * an interrupt mid-stream keeps the partial answer in history.
     """
     last_error: Exception | None = None
-    for attempt in range(MAX_API_RETRIES):
+    attempt = 0
+    while attempt < MAX_API_RETRIES:
         if agent.interrupted:
-            s.interrupted = True
+            s.interrupted, s.exit_reason = True, "interrupted"
             return None
+        streaming = _should_stream(agent, s)
+        if s.stream is not None:
+            s.stream.begin_attempt()
         try:
-            agent._emit("api_call", iteration=s.api_call_count, model=agent.model)
+            agent._emit("api_call", iteration=s.api_call_count, model=agent.model, stream=streaming)
+            if streaming:
+                hooks = s.stream.hooks(lambda: agent.interrupted)
+                response = await agent.transport.call_stream(agent.client, hooks, **s.api_kwargs)
+                s.stream.finish()
+                return response
             raw = agent.transport.call(agent.client, **s.api_kwargs)
             # Awaited only when it is awaitable: a scripted test transport can
             # stay a plain function without needing async def.
@@ -106,19 +128,47 @@ async def perform_api_call(agent, s: LoopState) -> NormalizedResponse | None:
         except asyncio.CancelledError:
             s.interrupted = True
             raise
+        except StreamInterrupted:
+            s.stream.finish()
+            s.interrupted, s.exit_reason = True, "interrupted"
+            if s.stream.delivered:
+                partial = s.stream.text
+                record_assistant_message(s, NormalizedResponse(
+                    content=partial, tool_calls=None, finish_reason="interrupted"))
+                s.final_response, s.streamed = partial, True
+            return None
         except Exception as exc:
             last_error = exc
-            if not _is_retryable(exc) or attempt == MAX_API_RETRIES - 1:
+            if streaming:
+                s.stream.finish()
+                if not s.stream.delivered and is_stream_unsupported(exc):
+                    logger.warning("streaming rejected by %s, falling back: %s", agent.profile.name, exc)
+                    agent._stream_disabled = True
+                    agent._emit("api_retry", error=f"streaming unsupported ({exc}); retrying without it",
+                                delay=0.0)
+                    continue                     # not counted: nothing was wrong with the request
+                if s.stream.delivered and not (s.stream.tool_started and _is_retryable(exc)):
+                    agent._emit("stream_error", error=str(exc))
+                    return NormalizedResponse(content=s.stream.text, tool_calls=None, finish_reason="length")
+                if s.stream.delivered:
+                    agent._emit("stream_reset", error=str(exc))
+            attempt += 1
+            if not _is_retryable(exc) or attempt >= MAX_API_RETRIES:
                 break
-            delay = min(2 ** attempt, 16) + random.random()
+            delay = min(2 ** (attempt - 1), 16) + random.random()
             logger.warning("API call failed (%s), retrying in %.1fs", exc, delay)
             agent._emit("api_retry", error=str(exc), delay=delay)
             await asyncio.sleep(delay)
 
     s.failed = True
     s.exit_reason = "api_error"
-    s.final_response = f"[API error after {MAX_API_RETRIES} attempts: {last_error}]"
+    s.final_response = f"[API error after {attempt} attempts: {last_error}]"
     return None
+
+
+def _should_stream(agent, s: LoopState) -> bool:
+    return (s.stream is not None and getattr(agent, "streaming", False)
+            and agent.transport.supports_streaming and not getattr(agent, "_stream_disabled", False))
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -159,6 +209,8 @@ async def run_tool_round(agent, s: LoopState, response: NormalizedResponse) -> N
          A missing reply makes the next request invalid on every provider.
     """
     calls = response.tool_calls or []
+    if s.stream is not None:
+        s.stream.segment_break()
     agent._emit("tool_round", count=len(calls))
 
     # A semaphore, not a thread pool: the cap is on how many tools run at once,
@@ -245,7 +297,8 @@ async def run_conversation(agent, user_message: str,
 
     offset = 1 if system else 0
     durable = len(history_in) if persisted_history is None else min(persisted_history, len(history_in))
-    s = LoopState(messages=messages, persist=persist, persisted_upto=offset + durable)
+    s = LoopState(messages=messages, persist=persist, persisted_upto=offset + durable,
+                  stream=StreamDelivery(agent._emit))
     started = time.time()
 
     while s.api_call_count < agent.max_iterations:
@@ -275,6 +328,7 @@ async def run_conversation(agent, user_message: str,
 
         # No tool calls: this text is the answer.
         s.final_response = response.content or ""
+        s.streamed = s.stream is not None and s.stream.delivered
         s.exit_reason = "final_response"
         agent._emit("final", text=s.final_response)
         break
@@ -301,6 +355,8 @@ async def run_conversation(agent, user_message: str,
         "duration_seconds": round(time.time() - started, 2),
         "interrupted": s.interrupted,
         "failed": s.failed,
+        # True when ``response`` already reached the event stream as stream_delta events.
+        "streamed": s.streamed,
         "exit_reason": s.exit_reason,
         # How many entries of ``history`` are durable (== len(history) unless a flush failed).
         "persisted": max(0, s.persisted_upto - offset),

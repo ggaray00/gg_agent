@@ -14,10 +14,12 @@ import json
 from typing import Any
 
 from .base import ProviderTransport
+from .streaming import StreamHooks, StreamInterrupted
 from .types import NormalizedResponse, ToolCall, Usage
 
 
 class AnthropicTransport(ProviderTransport):
+    supports_streaming = True
 
     # Anthropic stop_reason vocabulary -> OpenAI finish_reason.
     _STOP_REASON_MAP = {
@@ -125,6 +127,37 @@ class AnthropicTransport(ProviderTransport):
 
     async def call(self, client: Any, **api_kwargs) -> Any:
         return await client.messages.create(**api_kwargs)
+
+    async def call_stream(self, client: Any, hooks: StreamHooks, **api_kwargs) -> NormalizedResponse:
+        """Route the SSE events to the hooks; let the SDK assemble the message.
+
+        Tool-use JSON is not accumulated here — ``get_final_message()`` already
+        does that — so this only decides what the user gets to see early."""
+        in_tool = False
+        text_blocks = 0
+        async with client.messages.stream(**api_kwargs) as stream:
+            async for event in stream:
+                if hooks.is_interrupted():
+                    raise StreamInterrupted()
+                kind = getattr(event, "type", None)
+                if kind == "content_block_start":
+                    block = event.content_block
+                    if block.type == "tool_use":
+                        in_tool = True
+                        hooks.on_tool_start(block.name)
+                    elif block.type == "text":
+                        # normalize_response joins text blocks with "\n"; match it.
+                        if text_blocks and not in_tool:
+                            hooks.on_text("\n")
+                        text_blocks += 1
+                elif kind == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta" and not in_tool:
+                        hooks.on_text(delta.text)
+                    elif delta.type == "thinking_delta":
+                        hooks.on_reasoning(delta.thinking)
+            final = await stream.get_final_message()
+        return self.normalize_response(final)
 
     # ── Normalization ────────────────────────────────────────────────────
 

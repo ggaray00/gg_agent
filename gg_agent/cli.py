@@ -19,16 +19,54 @@ from .aio import run_sync
 from .providers import list_providers
 from .tools.registry import discover_builtin_tools, registry
 
-# Event rendering. hermes-agent has a whole display layer (spinners, streaming,
-# per-tool progress); this is the same event stream printed plainly.
+# Event rendering. hermes-agent has a whole display layer (spinners, boxes,
+# markdown tables); this is the same event stream printed plainly. Streamed answer
+# text goes to stdout as it arrives; everything else is status on stderr.
 _ICONS = {"api_call": "🤖", "tool_start": "🔧", "delegate_start": "🔀", "api_retry": "⚠️"}
+_DIM, _RESET = ("\033[2m", "\033[0m") if sys.stderr.isatty() else ("", "")
 
 
-def make_renderer(verbose: bool):
+def make_renderer(verbose: bool, show_reasoning: bool = False):
+    # Whether stdout sits at the start of a line, so status lines on stderr never
+    # land in the middle of a streamed sentence.
+    state = {"at_line_start": True, "reasoning_open": False}
+
+    def end_line() -> None:
+        if state["reasoning_open"]:
+            print(_RESET, file=sys.stderr, flush=True)
+            state["reasoning_open"] = False
+        if not state["at_line_start"]:
+            print(flush=True)
+            state["at_line_start"] = True
+
     def render(kind: str, payload: dict) -> None:
         indent = "  " * payload.get("depth", 0)
+        if kind == "stream_delta":
+            if state["reasoning_open"]:
+                print(_RESET, file=sys.stderr, flush=True)
+                state["reasoning_open"] = False
+            text = payload["text"]
+            print(text, end="", flush=True)
+            state["at_line_start"] = text.endswith("\n")
+            return
+        if kind == "reasoning_delta":
+            if show_reasoning or verbose:
+                if not state["reasoning_open"]:
+                    end_line()
+                    print(f"{indent}💭 {_DIM}", end="", file=sys.stderr)
+                    state["reasoning_open"] = True
+                print(payload["text"], end="", file=sys.stderr, flush=True)
+            return
+        if kind == "stream_break":
+            end_line()
+            return
+        if kind in {"api_call", "tool_gen_start", "tool_start", "tool_end", "delegate_start",
+                    "api_retry", "stream_error", "stream_reset", "mcp_server", "persist_error"}:
+            end_line()
         if kind == "api_call":
             print(f"{indent}{_ICONS[kind]} call #{payload['iteration']} → {payload['model']}", file=sys.stderr)
+        elif kind == "tool_gen_start":
+            print(f"{indent}⚡ preparing {payload['name']}…", file=sys.stderr)
         elif kind == "tool_start":
             args = payload.get("args") or {}
             preview = ", ".join(f"{k}={str(v)[:60]!r}" for k, v in list(args.items())[:3])
@@ -41,6 +79,11 @@ def make_renderer(verbose: bool):
                 print(f"{indent}   • {goal}", file=sys.stderr)
         elif kind == "api_retry":
             print(f"{indent}⚠️  {payload['error']} — retrying in {payload['delay']:.1f}s", file=sys.stderr)
+        elif kind == "stream_error":
+            print(f"{indent}⚠️  stream failed after partial output, keeping what arrived: {payload['error']}",
+                  file=sys.stderr)
+        elif kind == "stream_reset":
+            print(f"{indent}⚠️  connection dropped mid tool-call; reconnecting…", file=sys.stderr)
         elif kind == "mcp_server":
             print(f"{indent}🔌 mcp/{payload['server']}: {payload['status']}", file=sys.stderr)
         elif kind == "persist_error":
@@ -52,6 +95,8 @@ def make_renderer(verbose: bool):
                       "--signin EMAIL", file=sys.stderr)
             else:
                 print(f"{indent}⚠️  persistence ({payload.get('stage')}): {payload['error']}", file=sys.stderr)
+
+    render.end_line = end_line
     return render
 
 
@@ -64,7 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-iterations", type=int, default=50)
     p.add_argument("--max-depth", type=int, default=2, help="Subagent nesting cap.")
     p.add_argument("--no-delegation", action="store_true", help="Block the delegate_task tool.")
-    p.add_argument("-v", "--verbose", action="store_true", help="Show tool results too.")
+    p.add_argument("-v", "--verbose", action="store_true", help="Show tool results and reasoning too.")
+    p.add_argument("--no-stream", action="store_true",
+                   help="Print the answer when it is complete instead of as it arrives (or GG_STREAM=0).")
+    p.add_argument("--show-reasoning", action="store_true",
+                   help="Stream the model's reasoning to stderr, when it exposes any.")
     p.add_argument("--list-providers", action="store_true", help="Show providers and credential status.")
     p.add_argument("--list-tools", action="store_true")
     p.add_argument("--list-models", action="store_true",
@@ -366,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
             blocked_tools={"delegate_task"} if args.no_delegation else None,
             max_iterations=args.max_iterations,
             max_depth=args.max_depth,
-            event_callback=make_renderer(args.verbose),
+            event_callback=make_renderer(args.verbose, args.show_reasoning),
+            stream=False if args.no_stream else None,
             store=None if wants_persistence and account else False,
             user_id=account["user_id"] if account else None,
             resume=args.resume,
@@ -400,9 +450,18 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_once(agent: Agent, prompt: str) -> int:
     result = agent.run(prompt)
-    print(result["response"])
+    _print_response(agent, result)
     _print_footer(result)
     return 1 if result["failed"] else 0
+
+
+def _print_response(agent: Agent, result: dict) -> None:
+    """Print the answer — unless it was already streamed onto the screen."""
+    end_line = getattr(agent.event_callback, "end_line", None)
+    if end_line is not None:
+        end_line()
+    if not result.get("streamed"):
+        print(result["response"])
 
 
 def _print_footer(result: dict) -> None:
@@ -476,7 +535,7 @@ def _repl(agent: Agent) -> int:
             print("\ninterrupted", file=sys.stderr)
             agent.clear_interrupt()
             continue
-        print(result["response"])
+        _print_response(agent, result)
         _print_footer(result)
 
 

@@ -8,6 +8,12 @@ The client is an ASYNC SDK client and ``call`` is a coroutine; the loop awaits
 it. A transport whose ``call`` is a plain function still works — the loop awaits
 the result only when it is awaitable — which keeps scripted test doubles simple.
 
+Streaming is optional: a transport that sets ``supports_streaming`` also
+implements ``call_stream``, which pushes deltas through ``StreamHooks`` while it
+builds the response and then returns the same ``NormalizedResponse`` that
+``normalize_response`` would have. The loop picks the path; nothing downstream
+can tell which one ran.
+
 It does NOT own credentials, retries or interrupts — those stay on Agent. That
 split is what lets the agentic loop stay provider-agnostic: it always speaks
 OpenAI-shaped messages and always receives a ``NormalizedResponse`` back.
@@ -25,6 +31,9 @@ from .types import NormalizedResponse
 
 
 class ProviderTransport(ABC):
+    # True when ``call_stream`` is implemented.
+    supports_streaming: bool = False
+
     # Provider stop_reason -> OpenAI finish_reason. None = already OpenAI vocabulary.
     _STOP_REASON_MAP: dict[str, str] | None = None
 
@@ -53,6 +62,12 @@ class ProviderTransport(ABC):
     @abstractmethod
     async def call(self, client: Any, **api_kwargs) -> Any:
         """Perform the request. Separate from build_kwargs so retries can re-send."""
+
+    async def call_stream(self, client: Any, hooks: Any, **api_kwargs) -> NormalizedResponse:
+        """Perform the request streaming: feed ``hooks`` (a ``StreamHooks``) as
+        deltas arrive, return the assembled response. Raise ``StreamInterrupted``
+        when ``hooks.is_interrupted()`` turns true mid-stream."""
+        raise NotImplementedError(f"{type(self).__name__} does not stream")
 
     async def aclose_client(self, client: Any) -> None:
         """Release the client's connection pool. Override if the SDK differs."""

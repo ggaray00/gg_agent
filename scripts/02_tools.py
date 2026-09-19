@@ -8,7 +8,7 @@ Set VERBOSE = True to print tool RESULTS too — that is the switch you want whe
 the agent does something surprising.
 """
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── edit me ──────────────────────────────────────────────────────────────
 PROVIDER = None
@@ -37,7 +37,7 @@ def main() -> int:
     ) as agent:
         banner(agent, "tool loop")
         result = agent.run(PROMPT)
-        print(f"\n{result['response']}")
+        answer(result)
         footer(result)
     return 0
 

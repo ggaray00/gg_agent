@@ -69,6 +69,12 @@ class _LoopThread:
             return
         self._loop = self._thread = None
         try:
+            # Finalize async generators first (e.g. an HTTP stream body left
+            # half-read), or their cleanup is scheduled on a loop that never runs it.
+            asyncio.run_coroutine_threadsafe(loop.shutdown_asyncgens(), loop).result(timeout=2)
+        except Exception:
+            logger.debug("async generator shutdown failed", exc_info=True)
+        try:
             loop.call_soon_threadsafe(loop.stop)
             if thread is not None:
                 thread.join(timeout=5)

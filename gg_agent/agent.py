@@ -80,6 +80,11 @@ class Agent:
         temperature: float | None = None,
         cwd: str | None = None,
         event_callback: Callable[[str, dict], None] | None = None,
+        # Streaming: None = $GG_STREAM (on unless "0"/"false"/"off"). Deltas go
+        # to ``event_callback`` as stream_delta / reasoning_delta / tool_gen_start /
+        # stream_break events. Subagents never stream: parallel children would
+        # interleave their tokens on the same callback.
+        stream: bool | None = None,
         # MCP: False = off, True = load .mcp.json, a path = load that file,
         # or a list of MCPServerConfig. Connection happens on the first turn,
         # because __init__ is sync and connecting is not.
@@ -154,6 +159,11 @@ class Agent:
         self.max_iterations = max_iterations
         self.event_callback = event_callback
         self.depth, self.max_depth, self.parent = depth, max_depth, parent
+        if stream is None:
+            stream = os.getenv("GG_STREAM", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self.streaming = bool(stream) and depth == 0
+        # Set by the loop when the endpoint rejects streaming; sticks for the session.
+        self._stream_disabled = False
 
         self.history: list[dict[str, Any]] = []
         self._interrupt = threading.Event()

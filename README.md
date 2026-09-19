@@ -119,6 +119,8 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | `transports/base.py` | `ProviderTransport` ABC: convert → build → call → normalize | `agent/transports/base.py` |
 | `transports/chat_completions.py` | OpenAI + every OpenAI-compatible endpoint | `agent/transports/chat_completions.py` |
 | `transports/anthropic.py` | Messages API: system extraction, `tool_use`/`tool_result` blocks | `agent/transports/anthropic.py` |
+| `transports/streaming.py` | `StreamHooks`, tool-call delta reassembly, stream errors | `agent/chat_completion_helpers.py` (`_StreamingCall`, `_ToolCallAccumulator`) |
+| `stream_delivery.py` | what reaches the screen: `<think>` scrubbing, segment breaks, stream events | `agent/stream_delivery.py`, `agent/think_scrubber.py` |
 | `tools/registry.py` | `ToolEntry`, registration, toolset filtering, safe dispatch | `tools/registry.py` + `model_tools.handle_function_call` |
 | `tools/shell_tool.py` | `run_shell` | `tools/terminal_tool*.py` |
 | `tools/file_tools.py` | `read_file` / `write_file` / `list_dir` | `tools/file_tools.py`, `file_operations_*.py` |
@@ -142,6 +144,39 @@ how hermes scales that loop: each phase (`assemble_request`, `perform_api_call`,
 `run_tool_round`, …) reads the state fields it needs and rebinds the ones it owns, so a
 phase can move into its own module without changing a signature. hermes has ~20 such
 `agent/turn_*.py` modules threading one dataclass.
+
+---
+
+## Streaming
+
+On by default: the answer prints as it is generated. Turn it off with `--no-stream`,
+`GG_STREAM=0`, or `Agent(stream=False)`.
+
+A streaming transport still returns one `NormalizedResponse`, so the loop, history and
+persistence are unchanged. What streaming adds is a set of events on `event_callback`:
+
+| event | payload | meaning |
+|---|---|---|
+| `stream_delta` | `text` | visible answer text, in order |
+| `reasoning_delta` | `text` | reasoning (provider field, Anthropic thinking, or `<think>` tags) |
+| `tool_gen_start` | `name` | the model has started writing a call to this tool |
+| `stream_break` | — | tools are about to run; the next delta starts with a blank line |
+| `stream_error` / `stream_reset` | `error` | the stream failed after output (kept) / mid tool-call (retried) |
+
+The result dict gains `streamed: True` when `response` was already delivered as deltas,
+so a front end doesn't print it twice. `--show-reasoning` streams reasoning to stderr.
+
+The retry rules change, because text on screen can't be taken back:
+
+- an endpoint that rejects streaming turns it off for the session and retries without it;
+- a failure **before** any text was shown is retried normally;
+- a failure **after** text was shown is not retried: the partial text becomes the answer
+  (`finish_reason="length"`), except when a tool call was being written, which is retried;
+- an interrupt mid-stream keeps the partial answer in history.
+
+Subagents never stream, because parallel children would interleave their tokens. What
+hermes adds on top: a stale-stream watchdog, the gateway consumers that edit chat
+messages in place, and TTS.
 
 ---
 
@@ -414,17 +449,16 @@ GG_TEST_DATABASE_URL=postgresql://gg:gg@localhost:5432/gg_agent_test uv run pyte
 
 Roughly in the order worth adding back if you keep going:
 
-1. **Streaming** — token deltas to a callback (`agent/stream_delivery.py`).
-2. **Context compression** — summarize old turns before the window overflows
+1. **Context compression** — summarize old turns before the window overflows
    (`agent/context_compressor.py`, `trajectory_compressor.py`). Everything else stays
    usable without this; long sessions do not.
-3. **More persistence** — the transcript, resume and keyword search are here (Postgres,
+2. **More persistence** — the transcript, resume and keyword search are here (Postgres,
    above). Still missing: semantic search, per-model cost accounting, LLM-generated titles,
    and compaction-aware storage (`hermes_state*.py`, 20+ modules).
-4. **Failover & credential pools** — retry onto a fallback model/key on 429/5xx
+3. **Failover & credential pools** — retry onto a fallback model/key on 429/5xx
    (`agent/credential_pool.py`, `agent/error_classifier.py`).
-5. **Approval gates** — confirm before destructive tools run (`tools/write_approval.py`).
-6. **Prompt caching** — `cache_control` breakpoints; large cost win on long sessions
+4. **Approval gates** — confirm before destructive tools run (`tools/write_approval.py`).
+5. **Prompt caching** — `cache_control` breakpoints; large cost win on long sessions
    (`agent/prompt_caching.py`).
-7. **Live subagent control** — steering, heartbeats, worktree isolation, output schemas
+6. **Live subagent control** — steering, heartbeats, worktree isolation, output schemas
    (`tools/delegate_tool_{progress,registry,results}.py`).

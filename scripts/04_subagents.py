@@ -11,7 +11,7 @@ explicit form awaits `delegate_task` directly.
 
 import asyncio
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── edit me ──────────────────────────────────────────────────────────────
 PROVIDER = None
@@ -37,7 +37,7 @@ EXPLICIT_TASKS = [
 async def run_model_driven(agent) -> None:
     print("\n=== model-driven delegation ===")
     result = await agent.arun(MODEL_DRIVEN_PROMPT)
-    print(f"\n{result['response']}")
+    answer(result)
     footer(result)
 
 

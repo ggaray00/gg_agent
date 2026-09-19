@@ -63,8 +63,21 @@ def make_renderer(verbose: bool = False):
     switch when a run does something you didn't expect.
     """
 
+    at_line_start = True
+
     def render(kind: str, payload: dict) -> None:
+        nonlocal at_line_start
         indent = "  " * payload.get("depth", 0)
+        # Streamed answer text: printed as it arrives, status lines start on a fresh line.
+        if kind == "stream_delta":
+            print(payload["text"], end="", flush=True)
+            at_line_start = payload["text"].endswith("\n")
+            return
+        if kind in {"reasoning_delta", "final"}:
+            return
+        if not at_line_start:
+            print()
+            at_line_start = True
         if kind == "api_call":
             print(f"{indent}🤖 call #{payload['iteration']} → {payload['model']}")
         elif kind == "tool_start":
@@ -79,6 +92,8 @@ def make_renderer(verbose: bool = False):
                 print(f"{indent}   • {goal}")
         elif kind == "api_retry":
             print(f"{indent}⚠️  {payload['error']} — retrying in {payload['delay']:.1f}s")
+        elif kind == "tool_gen_start":
+            print(f"{indent}⚡ preparing {payload['name']}…")
 
     return render
 
@@ -89,6 +104,11 @@ def banner(agent, title: str = "") -> None:
     # os.getcwd(), not agent.cwd: the tools resolve paths against the process.
     print(f"[{agent.profile.name}/{agent.model} · {len(agent.tool_definitions())} tools · "
           f"cwd={os.getcwd()}]\n")
+
+
+def answer(result: dict) -> None:
+    """Print the final answer, unless the renderer already streamed it."""
+    print() if result.get("streamed") else print(f"\n{result['response']}")
 
 
 def footer(result: dict) -> None:

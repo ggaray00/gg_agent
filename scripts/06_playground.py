@@ -7,7 +7,7 @@ change one line without going back to the source to look up the name.
 
 import os
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── every knob, with its default ─────────────────────────────────────────
 PROVIDER = None              # None = auto-detect from the environment
@@ -60,7 +60,7 @@ def main() -> int:
         banner(agent, "playground")
 
         result = agent.run(PROMPT)
-        print(f"\n{result['response']}")
+        answer(result)
         footer(result)
 
         # The whole result dict, if you want to poke at it:

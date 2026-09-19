@@ -6,7 +6,7 @@ transcript, so turn 2 can refer to what happened in turn 1. Compare with
 KEEP_HISTORY = False, where every turn starts cold.
 """
 
-from _bootstrap import banner, footer, make_renderer, preflight
+from _bootstrap import answer, banner, footer, make_renderer, preflight
 
 # ── edit me ──────────────────────────────────────────────────────────────
 PROVIDER = None
@@ -32,7 +32,7 @@ def main() -> int:
         for i, turn in enumerate(TURNS, 1):
             print(f"\n› turn {i}: {turn}")
             result = agent.run(turn, keep_history=KEEP_HISTORY)
-            print(f"\n{result['response']}")
+            answer(result)
             footer(result)
             print(f"[history: {len(agent.history)} messages]")
     return 0

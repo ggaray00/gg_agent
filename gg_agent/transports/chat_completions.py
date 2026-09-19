@@ -13,10 +13,12 @@ from typing import Any
 
 from ..providers.base import OMIT_TEMPERATURE
 from .base import ProviderTransport
+from .streaming import StreamDropped, StreamHooks, StreamInterrupted, ToolCallAccumulator, aclose_quietly
 from .types import NormalizedResponse, ToolCall, Usage
 
 
 class ChatCompletionsTransport(ProviderTransport):
+    supports_streaming = True
 
     @property
     def api_mode(self) -> str:
@@ -81,6 +83,76 @@ class ChatCompletionsTransport(ProviderTransport):
 
     async def call(self, client: Any, **api_kwargs) -> Any:
         return await client.chat.completions.create(**api_kwargs)
+
+    async def call_stream(self, client: Any, hooks: StreamHooks, **api_kwargs) -> NormalizedResponse:
+        stream = await client.chat.completions.create(
+            **api_kwargs, stream=True, stream_options={"include_usage": True})
+
+        # Some endpoints ignore stream=True and answer in one piece. Take it, and
+        # replay it through the hooks so the caller still sees the text.
+        if not hasattr(stream, "__aiter__"):
+            response = self.normalize_response(stream)
+            if response.reasoning:
+                hooks.on_reasoning(response.reasoning)
+            if response.content:
+                hooks.on_text(response.content)
+            for tc in response.tool_calls or []:
+                hooks.on_tool_start(tc.name)
+            return response
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tools = ToolCallAccumulator()
+        finish_reason: str | None = None
+        usage: Any = None
+        try:
+            async for chunk in stream:
+                if hooks.is_interrupted():
+                    raise StreamInterrupted()
+                # Usage arrives on a final chunk with no choices: read it first.
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    hooks.on_reasoning(reasoning)
+
+                text = getattr(delta, "content", None)
+                if text:
+                    content_parts.append(text)
+                    # Once a tool call has started, trailing text is not the answer.
+                    if not tools:
+                        hooks.on_text(text)
+
+                for tc_delta in getattr(delta, "tool_calls", None) or []:
+                    name = tools.feed(tc_delta)
+                    if name:
+                        hooks.on_tool_start(name)
+        finally:
+            await aclose_quietly(stream)
+
+        tool_calls, truncated = tools.materialize()
+        if truncated and finish_reason is None:
+            raise StreamDropped("stream connection dropped mid tool-call")
+        if finish_reason is None:
+            finish_reason = "tool_calls" if tool_calls else "stop"
+        return NormalizedResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls or None,
+            finish_reason=self.map_finish_reason(finish_reason),
+            reasoning="".join(reasoning_parts) or None,
+            usage=Usage.from_openai(usage) if usage is not None else None,
+        )
 
     # ── Normalization ────────────────────────────────────────────────────
 
