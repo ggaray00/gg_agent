@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "theia-browser",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "/Users/ggaray/Projects/theia/examples/browser", "run", "start", "--", "/Users/ggaray/Projects/gg_agent"],
+      "port": 3000
+    }
+  ]
+}

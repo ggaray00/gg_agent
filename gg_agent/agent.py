@@ -27,6 +27,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .aio import run_sync
+from .home import get_working_dir
 from .loop import run_conversation
 from .persistence import SUBAGENT_SOURCE, SessionStore, get_default_store
 from .prompts import build_system_prompt
@@ -122,7 +123,7 @@ class Agent:
         self.temperature = temperature
 
         self.session_id = uuid.uuid4().hex[:12]
-        self.cwd = os.path.abspath(cwd) if cwd else os.getcwd()
+        self.cwd = os.path.abspath(cwd) if cwd else get_working_dir()
 
         self.registry = registry
         self.enabled_toolsets = enabled_toolsets

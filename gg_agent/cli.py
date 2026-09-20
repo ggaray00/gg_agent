@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .agent import Agent, resolve_provider
 from .aio import run_sync
+from .home import ensure_gg_home, get_gg_home, get_working_dir
 from .providers import list_providers
 from .tools.registry import discover_builtin_tools, registry
 
@@ -146,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
 # token. The password is checked against the database at --signin / --register.
 
 def _account_file() -> Path:
-    return Path(os.getenv("GG_HOME") or Path.home() / ".gg_agent") / "user.json"
+    return get_gg_home() / "user.json"
 
 
 def _load_account() -> dict | None:
@@ -159,7 +160,7 @@ def _load_account() -> dict | None:
 
 def _save_account(user) -> None:
     path = _account_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_gg_home()
     path.write_text(json.dumps({"user_id": user.id, "email": user.email}))
     path.chmod(0o600)
 
@@ -354,6 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
+
+    # Home (config/state) and working dir (what the tools act on) are decided
+    # once, here, before anything reads either. GG_CWD is the anchor a tool falls
+    # back to if the launch directory disappears mid-run; setdefault so a caller
+    # that already pinned one (a wrapper, a test) keeps it.
+    ensure_gg_home()
+    os.environ.setdefault("GG_CWD", get_working_dir())
 
     if args.login:
         return _cmd_login(args.login.lower())

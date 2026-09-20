@@ -6,9 +6,10 @@ tools/delegate_tool_progress._build_child_system_prompt
 
 from __future__ import annotations
 
-import os
 import platform
 from datetime import date
+
+from .home import get_working_dir
 
 MAIN_SYSTEM_PROMPT = """You are gg-agent, a capable autonomous coding assistant.
 
@@ -69,7 +70,7 @@ def build_system_prompt(extra: str = "", cwd: str | None = None, *, session_sear
              "\n## Environment\n"
              f"- Date: {date.today().isoformat()}\n"
              f"- Platform: {platform.system()} {platform.release()}\n"
-             f"- Working directory: {cwd or os.getcwd()}\n"]
+             f"- Working directory: {cwd or get_working_dir()}\n"]
     if extra and extra.strip():
         parts.append("\n" + extra.strip())
     return "".join(parts)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from ..home import get_working_dir
 from .registry import registry, tool_error
 
 DEFAULT_TIMEOUT = 120
@@ -24,7 +25,7 @@ async def run_shell(command: str, cwd: str | None = None, timeout: int = DEFAULT
     """
     if not command or not command.strip():
         return tool_error("command is required")
-    workdir = os.path.abspath(os.path.expanduser(cwd)) if cwd else os.getcwd()
+    workdir = os.path.abspath(os.path.expanduser(cwd)) if cwd else get_working_dir()
     if not os.path.isdir(workdir):
         return tool_error(f"cwd does not exist: {workdir}")
 
