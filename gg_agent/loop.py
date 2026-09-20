@@ -84,6 +84,7 @@ def assemble_request(agent, s: LoopState) -> None:
         profile=agent.profile,
         temperature=agent.temperature,
         max_tokens=agent.max_tokens,
+        cache_prompt=agent.prompt_caching,
     )
 
 

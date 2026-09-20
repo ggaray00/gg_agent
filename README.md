@@ -19,7 +19,7 @@ uv run gg-agent --list-providers --list-tools
 uv run gg-agent --list-models            # live catalog for the active provider
 uv run python example_subagents.py       # delegation, two ways
 
-uv run pytest                            # 73 offline tests, no keys or database needed
+uv run pytest                            # 107 offline tests, no keys or database needed
 uv run ruff check gg_agent/
 ```
 
@@ -118,7 +118,7 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | `transports/types.py` | `ToolCall` / `Usage` / `NormalizedResponse` — the only types the loop sees | `agent/transports/types.py` |
 | `transports/base.py` | `ProviderTransport` ABC: convert → build → call → normalize | `agent/transports/base.py` |
 | `transports/chat_completions.py` | OpenAI + every OpenAI-compatible endpoint | `agent/transports/chat_completions.py` |
-| `transports/anthropic.py` | Messages API: system extraction, `tool_use`/`tool_result` blocks | `agent/transports/anthropic.py` |
+| `transports/anthropic.py` | Messages API: system extraction, `tool_use`/`tool_result` blocks, cache breakpoints | `agent/transports/anthropic.py` + `agent/prompt_caching.py` |
 | `transports/streaming.py` | `StreamHooks`, tool-call delta reassembly, stream errors | `agent/chat_completion_helpers.py` (`_StreamingCall`, `_ToolCallAccumulator`) |
 | `stream_delivery.py` | what reaches the screen: `<think>` scrubbing, segment breaks, stream events | `agent/stream_delivery.py`, `agent/think_scrubber.py` |
 | `tools/registry.py` | `ToolEntry`, registration, toolset filtering, safe dispatch | `tools/registry.py` + `model_tools.handle_function_call` |
@@ -144,6 +144,37 @@ how hermes scales that loop: each phase (`assemble_request`, `perform_api_call`,
 `run_tool_round`, …) reads the state fields it needs and rebinds the ones it owns, so a
 phase can move into its own module without changing a signature. hermes has ~20 such
 `agent/turn_*.py` modules threading one dataclass.
+
+---
+
+## Prompt caching
+
+On by default. Caching is a **prefix match** — the key is the exact bytes of the
+rendered prompt up to each breakpoint — and the render order is
+`tools` → `system` → `messages`. Two of the four breakpoints the API allows cover an
+agent loop: one on the system block, which also caches the tool definitions behind it,
+and one on the last message, so the next iteration reads back everything before it.
+Cache reads cost ~0.1× input price, writes 1.25×, so a turn breaks even on its second
+API call.
+
+Only `transports/anthropic.py` asks for this explicitly — `cache_control` is Anthropic's
+parameter. Every OpenAI-compatible endpoint (OpenAI, Groq, DeepSeek, OpenRouter) caches
+prefixes on its own with no request parameter, and `transports/chat_completions.py`
+swallows the flag rather than forwarding it. What pays off on *all* of them is the
+prefix discipline the markers force: tools serialized in a stable order
+(`tools/registry.py` sorts by name), a system prompt built once per session rather than
+per request, and history that is appended to, never rewritten.
+
+```bash
+uv run gg-agent --no-prompt-cache "…"     # or Agent(prompt_caching=False)
+```
+
+`Usage` reports the split: `cached_tokens` (served from cache) and `cache_write_tokens`
+(written to it) are both parts of `prompt_tokens`, never additions to it. Anthropic's
+`input_tokens` is the *uncached remainder*, so the transport adds the cache fields back
+before reporting — otherwise a long cached session under-reports its own prompt size.
+Watch those fields after any change to prompt assembly: caching fails silently, and a
+broken prefix looks exactly like a working one except on the bill.
 
 ---
 
@@ -425,8 +456,9 @@ No network, no keys, no database, and they never read your real credential store
 scripted fake transport drives the real loop:
 
 ```bash
-uv run pytest -q                      # all 73
+uv run pytest -q                      # all 107
 uv run pytest tests/test_loop.py      # loop, tool rounds, ordering, retries, caps
+uv run pytest tests/test_prompt_caching.py  # breakpoint placement, prefix stability, usage
 uv run pytest tests/test_subagents.py # delegation, depth caps, both transports
 uv run pytest tests/test_async.py     # sync wrappers, concurrency, cancellation, dispatch
 uv run pytest tests/test_mcp.py       # config, namespacing, schema translation, failures
@@ -458,7 +490,5 @@ Roughly in the order worth adding back if you keep going:
 3. **Failover & credential pools** — retry onto a fallback model/key on 429/5xx
    (`agent/credential_pool.py`, `agent/error_classifier.py`).
 4. **Approval gates** — confirm before destructive tools run (`tools/write_approval.py`).
-5. **Prompt caching** — `cache_control` breakpoints; large cost win on long sessions
-   (`agent/prompt_caching.py`).
-6. **Live subagent control** — steering, heartbeats, worktree isolation, output schemas
+5. **Live subagent control** — steering, heartbeats, worktree isolation, output schemas
    (`tools/delegate_tool_{progress,registry,results}.py`).

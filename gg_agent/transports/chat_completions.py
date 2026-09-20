@@ -53,6 +53,10 @@ class ChatCompletionsTransport(ProviderTransport):
     def build_kwargs(self, model: str, messages: list[dict[str, Any]],
                      tools: list[dict[str, Any]] | None = None, **params) -> dict[str, Any]:
         profile = params.pop("profile", None)
+        # Swallowed, not forwarded: every OpenAI-compatible endpoint caches
+        # prefixes on its own with no request parameter, so there is nothing to
+        # ask for — and an unknown key here would be a 400.
+        params.pop("cache_prompt", None)
         sanitized = self.convert_messages(messages)
         if profile is not None:
             sanitized = profile.prepare_messages(sanitized)

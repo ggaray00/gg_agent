@@ -79,6 +79,13 @@ class Agent:
         max_iterations: int = 50,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        # Prompt caching: mark the stable part of the prompt so the provider can
+        # skip re-reading it. Only the Anthropic transport asks for it explicitly
+        # (see transports/anthropic.py); every OpenAI-compatible endpoint caches
+        # prefixes on its own either way. Off costs ~25% more on the first call
+        # of a turn and saves ~90% on the rest, so it is worth turning off only
+        # when a session really is one call long.
+        prompt_caching: bool = True,
         cwd: str | None = None,
         event_callback: Callable[[str, dict], None] | None = None,
         # Streaming: None = $GG_STREAM (on unless "0"/"false"/"off"). Deltas go
@@ -121,6 +128,7 @@ class Agent:
         self._pinned_credentials = bool(api_key and base_url)
         self.max_tokens = max_tokens or self.profile.default_max_tokens
         self.temperature = temperature
+        self.prompt_caching = prompt_caching
 
         self.session_id = uuid.uuid4().hex[:12]
         self.cwd = os.path.abspath(cwd) if cwd else get_working_dir()

@@ -113,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="Show tool results and reasoning too.")
     p.add_argument("--no-stream", action="store_true",
                    help="Print the answer when it is complete instead of as it arrives (or GG_STREAM=0).")
+    p.add_argument("--no-prompt-cache", action="store_true",
+                   help="Don't mark the prompt for caching (Anthropic; other providers cache anyway).")
     p.add_argument("--show-reasoning", action="store_true",
                    help="Stream the model's reasoning to stderr, when it exposes any.")
     p.add_argument("--list-providers", action="store_true", help="Show providers and credential status.")
@@ -425,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             max_depth=args.max_depth,
             event_callback=make_renderer(args.verbose, args.show_reasoning),
             stream=False if args.no_stream else None,
+            prompt_caching=not args.no_prompt_cache,
             store=None if wants_persistence and account else False,
             user_id=account["user_id"] if account else None,
             resume=args.resume,

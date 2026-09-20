@@ -17,6 +17,38 @@ from .base import ProviderTransport
 from .streaming import StreamHooks, StreamInterrupted
 from .types import NormalizedResponse, ToolCall, Usage
 
+# A breakpoint says "cache the prompt from byte 0 through this block". The
+# 5-minute TTL is the cheap one to write (1.25x vs 2x for "1h") and an agent
+# loop's iterations are seconds apart, so every read refreshes it anyway.
+CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def as_blocks(message: dict[str, Any]) -> None:
+    """Render a string body as a one-element block list, in place.
+
+    Only blocks can carry ``cache_control``, so the marked turn has to be one.
+    Every turn is converted, not just that one, because the SHAPE has to be
+    stable across iterations: a turn sent as a bare string on this request and
+    as a block list on the next (because that is the one that got the marker)
+    moves the prefix bytes, and a moved prefix is a cache miss.
+    """
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        message["content"] = [{"type": "text", "text": content}]
+
+
+def mark_cache_breakpoint(message: dict[str, Any]) -> bool:
+    """Put a breakpoint on a message's last content block.
+
+    Returns whether a marker was placed; an empty turn has nothing to hang one on.
+    """
+    as_blocks(message)
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    content[-1]["cache_control"] = dict(CACHE_CONTROL)
+    return True
+
 
 class AnthropicTransport(ProviderTransport):
     supports_streaming = True
@@ -104,7 +136,23 @@ class AnthropicTransport(ProviderTransport):
 
     def build_kwargs(self, model: str, messages: list[dict[str, Any]],
                      tools: list[dict[str, Any]] | None = None, **params) -> dict[str, Any]:
+        """Assemble the request, and mark it up for prompt caching.
+
+        Caching is a PREFIX match — the key is the exact bytes of the rendered
+        prompt up to each breakpoint — and the render order is
+        ``tools`` -> ``system`` -> ``messages``. Two breakpoints (of the four
+        the API allows) cover an agent loop:
+
+        * one on the system block, which is the same every iteration and, being
+          last in the stable region, caches the tool definitions with it;
+        * one on the final message, so the next iteration — which has this
+          whole conversation as its prefix — reads back everything before it.
+
+        Below the model's minimum cacheable prefix (512-4096 tokens, depending
+        on the model) the markers are silently ignored, which costs nothing.
+        """
         profile = params.pop("profile", None)
+        cache_prompt = params.pop("cache_prompt", True)
         system, converted = self.convert_messages(messages)
 
         api_kwargs: dict[str, Any] = {
@@ -115,9 +163,16 @@ class AnthropicTransport(ProviderTransport):
                           or getattr(profile, "default_max_tokens", None) or 8192,
         }
         if system:
-            api_kwargs["system"] = system
+            api_kwargs["system"] = (
+                [{"type": "text", "text": system, "cache_control": dict(CACHE_CONTROL)}]
+                if cache_prompt else system
+            )
         if tools:
             api_kwargs["tools"] = self.convert_tools(tools)
+        if cache_prompt and converted:
+            for message in converted:
+                as_blocks(message)
+            mark_cache_breakpoint(converted[-1])
 
         temperature = params.pop("temperature", None)
         if temperature is not None:
@@ -184,10 +239,26 @@ class AnthropicTransport(ProviderTransport):
             tool_calls=tool_calls or None,
             finish_reason=self.map_finish_reason(getattr(response, "stop_reason", None)),
             reasoning="\n".join(thinking_parts) or None,
-            usage=Usage(
-                prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "output_tokens", 0) or 0,
-                total_tokens=(getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0),
-                cached_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            ) if usage else None,
+            usage=self._usage(usage) if usage else None,
+        )
+
+    @staticmethod
+    def _usage(usage: Any) -> Usage:
+        """Messages API counts -> the normalized (OpenAI-convention) shape.
+
+        ``input_tokens`` here is the UNCACHED REMAINDER, not the whole prompt:
+        the real prompt size is ``input_tokens + cache_read + cache_creation``.
+        Reporting it raw would silently under-count every cached turn — an
+        agent that ran for an hour looking like it spent 4K input tokens.
+        """
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        prompt = (getattr(usage, "input_tokens", 0) or 0) + cache_read + cache_write
+        completion = getattr(usage, "output_tokens", 0) or 0
+        return Usage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+            cached_tokens=cache_read,
+            cache_write_tokens=cache_write,
         )
