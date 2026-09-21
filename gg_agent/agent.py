@@ -28,7 +28,7 @@ from typing import Any
 
 from .aio import run_sync
 from .home import get_working_dir
-from .loop import run_conversation
+from .loop import mark_persisted, run_conversation
 from .persistence import SUBAGENT_SOURCE, SessionStore, get_default_store
 from .prompts import build_system_prompt
 from .providers import ProviderProfile, get_provider_profile, iter_configured
@@ -86,6 +86,13 @@ class Agent:
         # of a turn and saves ~90% on the rest, so it is worth turning off only
         # when a session really is one call long.
         prompt_caching: bool = True,
+        # Context compression: None = $GG_COMPRESS (on unless "0"/"false"/"off").
+        # Keeps a long session inside the model's window by pruning old tool
+        # output before each request (see ``gg_agent.compression``).
+        # ``context_length`` overrides the window this model is assumed to have;
+        # without it the model name decides, then $GG_CONTEXT_LENGTH.
+        compress: bool | None = None,
+        context_length: int | None = None,
         cwd: str | None = None,
         event_callback: Callable[[str, dict], None] | None = None,
         # Streaming: None = $GG_STREAM (on unless "0"/"false"/"off"). Deltas go
@@ -129,6 +136,17 @@ class Agent:
         self.max_tokens = max_tokens or self.profile.default_max_tokens
         self.temperature = temperature
         self.prompt_caching = prompt_caching
+        if compress is None:
+            compress = os.getenv("GG_COMPRESS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self.compress = bool(compress)
+        self.context_length = context_length
+        # Estimated-to-billed prompt-token ratio, corrected after every response
+        # that reports usage. 1.0 until the first one lands.
+        self._token_scale = 1.0
+        # Compression state: when the summarizer may be tried again, and how many
+        # passes in a row reclaimed too little to be worth the cache miss.
+        self._summary_cooldown_until = 0.0
+        self._compression_strikes = 0
 
         self.session_id = uuid.uuid4().hex[:12]
         self.cwd = os.path.abspath(cwd) if cwd else get_working_dir()
@@ -159,7 +177,6 @@ class Agent:
         self._pending_resume = resume
         self._store_ready = False
         self._session_created = False
-        self._persisted_len = 0              # how many of self.history are durable
         self._sessions_to_end: list[str] = []
 
         self.system_prompt = system_prompt or build_system_prompt(
@@ -307,7 +324,9 @@ class Agent:
             self._sessions_to_end.append(self.session_id)
         self.session_id = session_id
         self.history = await self.store.load_history(session_id)
-        self._persisted_len = len(self.history)
+        # Everything that came out of the store is durable; marking it stops the
+        # next flush from writing the whole transcript back a second time.
+        mark_persisted(self.history)
         self._session_created = True
 
     async def _ensure_session(self, *, raise_errors: bool = False) -> None:
@@ -405,11 +424,9 @@ class Agent:
         await self.refresh_credentials()
         result = await run_conversation(
             self, user_message, conversation_history=self.history,
-            persist=self._persist if persisting else None,
-            persisted_history=self._persisted_len if persisting else None)
+            persist=self._persist if persisting else None)
         if keep_history:
             self.history = result["history"]
-            self._persisted_len = result["persisted"] if persisting else len(self.history)
         if persisting and self._session_created:
             usage = result["usage"]
             try:
@@ -433,7 +450,6 @@ class Agent:
         """Clear the conversation. With a store, that means a NEW session; the old
         one is ended on the next turn or at close (this method is sync)."""
         self.history = []
-        self._persisted_len = 0
         if self.store is not None:
             if self._session_created:
                 self._sessions_to_end.append(self.session_id)

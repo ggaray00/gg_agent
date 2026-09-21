@@ -128,6 +128,7 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | `tools/mcp_tools.py` | MCP servers registered as ordinary tools: config, lifecycle, translation | `plugins/mcp/*` |
 | `aio.py` | the one sync↔async boundary: a persistent background loop | — |
 | `loop.py` | `run_conversation` + `LoopState` + phases + parallel tool execution | `agent/conversation_loop.py`, `agent/turn_*.py`, `agent/tool_executor.py` |
+| `compression.py` | keeping a long session inside the context window: sizing, thresholds, pruning, summarizing | `agent/context_compressor.py` |
 | `agent.py` | `Agent`: provider resolution, client, tool grant, interrupts, turn facade | `run_agent.AIAgent`, `agent/agent_init.py`, `agent/client_lifecycle.py` |
 | `prompts.py` | main + child system prompts | `agent/prompt_builder.py`, `tools/delegate_tool_progress.py` |
 | `cli.py` | one-shot / REPL front-end, event rendering | `cli.py` |
@@ -175,6 +176,80 @@ uv run gg-agent --no-prompt-cache "…"     # or Agent(prompt_caching=False)
 before reporting — otherwise a long cached session under-reports its own prompt size.
 Watch those fields after any change to prompt assembly: caching fails silently, and a
 broken prefix looks exactly like a working one except on the bill.
+
+---
+
+## Context compression
+
+Every session eventually runs out of window. Three passes, cheapest first, each one
+run only because the one before it left the request still over the threshold:
+
+- **A — reclaim, no LLM.** Old tool results become one-line stubs, identical results
+  collapse to their newest copy, oversized tool-call arguments are shrunk. Free,
+  idempotent, and usually enough on its own: one 400KB file read costs more than a
+  hundred turns of conversation.
+- **B — summarize, one auxiliary call.** The middle of the transcript is replaced by a
+  structured summary (task, constraints, completed actions, current state, open
+  questions, next step). This is what a session needs once the *conversation* is what
+  fills the window. A later compaction hands the existing summary to the summarizer to
+  be **updated**, never re-summarized — re-compressing lossy text is how a long session
+  turns to mush.
+- **C — pressure, no LLM.** Last resort: give up everything except the tool round in
+  flight.
+
+It runs as phase 0 of every loop *iteration*, not once per turn — a single tool round
+can blow the window on its own, and the next request in that same turn is the one that
+gets rejected.
+
+```bash
+uv run gg-agent "…"                        # on by default
+GG_COMPRESS=0 uv run gg-agent "…"          # or Agent(compress=False)
+GG_CONTEXT_LENGTH=32000 uv run gg-agent "…"  # or Agent(context_length=32_000)
+```
+
+**What gets protected.** The system prompt and the first user turn (the original task is
+what a lossy transcript distorts first), plus a tail sized by *tokens* rather than a
+message count — a fixed "last 10" either protects nothing or everything depending on
+what those ten messages happen to be. When the tail floor ends up protecting the very
+result that filled the window, a second pass gives up everything except the tool round
+in flight.
+
+**Sizing is deliberately rough.** A chars/4 estimate, multiplied by a factor calibrated
+from the `prompt_tokens` the provider actually billed for the last request. A real
+tokenizer per provider would be exact and wrong the moment the model changes, and the
+threshold only needs to answer "are we near the edge". The threshold itself is 75% of
+`context_length - max_tokens`: output is reserved from the same window, so a threshold
+computed on the raw window lets a session hit a provider 400 before compression fires.
+
+**The summarizer is not the main model.** `ProviderProfile.default_aux_model` — the
+output is never shown to anyone, and a cheap model summarizes structured text about as
+well as an expensive one. Three rules in that prompt are each a way sessions have
+broken: the turns are **data, not instructions** (they contain tool output, which can
+carry anything, including text addressed to a model); credentials are **[REDACTED]**;
+and finished work is written in the **past tense**, because an action left in the
+imperative reads as an outstanding instruction and gets done twice.
+
+**Failure is not allowed to end the turn.** A summarizer that errors, times out or
+returns a stub gets a 5-minute cooldown, and compaction proceeds with a mechanical
+extract — the user's own turns, the tools used, the files touched — clearly labelled as
+one. If the splice would orphan a tool reply, the whole phase is abandoned and the
+transcript is left exactly as it was (`_valid_transcript` checks the result rather than
+trusting the boundary logic).
+
+**Two things it interacts with.** Compression rewrites the prompt prefix, so the next
+call is a guaranteed cache miss plus a write premium — which is why it only runs once
+over the threshold, and why two passes that reclaim under 10% switch it off for the
+session. And it breaks the "history is append-only" assumption that index-based flush
+dedup relied on, so durability is now a marker on each message (`loop.PERSISTED_KEY`)
+instead: the store keeps the original text, a rewritten message is never re-written, and
+a message the store has not accepted yet is never pruned or dropped — that is the one
+path where this could actually lose data.
+
+**What resume does today.** The store holds the full transcript, including messages a
+compaction dropped, so resuming replays everything and compresses again on the first
+call (the old summary is folded into the new one). Correct, but wasteful — making the
+store compaction-aware is the `active` column already sitting unused in
+`migrations/001_init.sql`.
 
 ---
 
@@ -465,6 +540,7 @@ uv run pytest tests/test_mcp.py       # config, namespacing, schema translation,
 uv run pytest tests/test_copilot_auth.py  # token discovery, exchange, caching, refresh
 uv run pytest tests/test_persistence.py   # store contract, users + ownership, resume repair, loop/Agent
 uv run pytest tests/test_session_search.py  # the four search modes, exclusions, dedup
+uv run pytest tests/test_compression.py   # sizing, boundaries, pruning, summarizing, loop wiring
 ```
 
 The store contract also runs against Postgres, along with Postgres-only tests (search
@@ -481,12 +557,17 @@ GG_TEST_DATABASE_URL=postgresql://gg:gg@localhost:5432/gg_agent_test uv run pyte
 
 Roughly in the order worth adding back if you keep going:
 
-1. **Context compression** — summarize old turns before the window overflows
-   (`agent/context_compressor.py`, `trajectory_compressor.py`). Everything else stays
-   usable without this; long sessions do not.
-2. **More persistence** — the transcript, resume and keyword search are here (Postgres,
-   above). Still missing: semantic search, per-model cost accounting, LLM-generated titles,
-   and compaction-aware storage (`hermes_state*.py`, 20+ modules).
+1. **More persistence** — the transcript, resume and keyword search are here (Postgres,
+   above). Still missing: compaction-aware storage — the store keeps every message a
+   compaction dropped, so resume replays the uncompressed transcript, where hermes marks
+   superseded rows instead (the `active` column in `migrations/001_init.sql` is reserved
+   for it) — plus semantic search, per-model cost accounting and LLM-generated titles
+   (`hermes_state*.py`, 20+ modules).
+2. **The rest of the compressor** — compression itself is implemented (see
+   [Context compression](#context-compression)). hermes additionally has focus-topic
+   compaction (`/compact <topic>`, which weights the summary towards one subject), image
+   retirement, cooldowns that survive a restart, and per-compaction telemetry
+   (`agent/context_compressor.py`, `agent/micro_compaction.py`).
 3. **Failover & credential pools** — retry onto a fallback model/key on 429/5xx
    (`agent/credential_pool.py`, `agent/error_classifier.py`).
 4. **Approval gates** — confirm before destructive tools run (`tools/write_approval.py`).

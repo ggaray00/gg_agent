@@ -281,6 +281,11 @@ def roles(store, sid):
     return [m.role for m in run_sync(store.get_messages(sid))]
 
 
+def public(messages):
+    """History without the loop's internal bookkeeping keys (``_persisted``)."""
+    return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+
+
 def test_agent_persists_turn_in_order_and_resumes():
     store = InMemorySessionStore()
     SCRIPT[:] = [call("run_shell", {"command": "echo hi"}), say("it printed hi")]
@@ -383,7 +388,8 @@ def test_crash_mid_tool_round_resumes_cleanly():
         # ...and resume drops the unanswered call so the next request is valid.
         b = Agent(provider="persist-fake", store=store, user_id=a.user_id, resume=a.session_id)
         run_sync(b.astart())
-        assert b.history == [{"role": "user", "content": "do the risky thing"}]
+        # (resumed messages carry the loop's durability marker; compare the wire fields)
+        assert public(b.history) == [{"role": "user", "content": "do the risky thing"}]
     finally:
         registry._tools.pop("persist_test_boom", None)
 

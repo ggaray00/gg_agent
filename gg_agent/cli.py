@@ -62,7 +62,9 @@ def make_renderer(verbose: bool, show_reasoning: bool = False):
             end_line()
             return
         if kind in {"api_call", "tool_gen_start", "tool_start", "tool_end", "delegate_start",
-                    "api_retry", "stream_error", "stream_reset", "mcp_server", "persist_error"}:
+                    "api_retry", "stream_error", "stream_reset", "mcp_server", "persist_error",
+                    "context_compressed", "context_full", "summarizing", "summary_failed",
+                    "compression_disabled"}:
             end_line()
         if kind == "api_call":
             print(f"{indent}{_ICONS[kind]} call #{payload['iteration']} → {payload['model']}", file=sys.stderr)
@@ -85,6 +87,22 @@ def make_renderer(verbose: bool, show_reasoning: bool = False):
                   file=sys.stderr)
         elif kind == "stream_reset":
             print(f"{indent}⚠️  connection dropped mid tool-call; reconnecting…", file=sys.stderr)
+        elif kind == "summarizing":
+            print(f"{indent}🗜️  summarizing {payload['messages']} older messages "
+                  f"({payload['tokens']:,} tokens)…", file=sys.stderr)
+        elif kind == "summary_failed":
+            print(f"{indent}⚠️  summary failed ({payload['error']}) — keeping a mechanical "
+                  "extract instead", file=sys.stderr)
+        elif kind == "compression_disabled":
+            print(f"{indent}⚠️  compression is not freeing enough space ({payload['tokens']:,} "
+                  "tokens); turning it off for this session — /new starts fresh", file=sys.stderr)
+        elif kind == "context_compressed":
+            print(f"{indent}🗜️  context {payload['before']:,} → {payload['after']:,} tokens "
+                  f"(threshold {payload['threshold']:,})", file=sys.stderr)
+        elif kind == "context_full":
+            print(f"{indent}⚠️  context at {payload['tokens']:,} tokens with nothing left to prune "
+                  f"(threshold {payload['threshold']:,}) — start a new session with /new",
+                  file=sys.stderr)
         elif kind == "mcp_server":
             print(f"{indent}🔌 mcp/{payload['server']}: {payload['status']}", file=sys.stderr)
         elif kind == "persist_error":

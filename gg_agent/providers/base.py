@@ -37,6 +37,9 @@ class ProviderProfile:
     # ── Model catalog ─────────────────────────────────────────
     default_model: str = ""
     fallback_models: tuple[str, ...] = ()
+    # Context window, when the provider pins one regardless of model name.
+    # 0 = let the model name decide (see ``compression.MODEL_CONTEXT_LENGTHS``).
+    context_length: int = 0
 
     # ── Request-level quirks ──────────────────────────────────
     default_headers: dict[str, str] = field(default_factory=dict)

@@ -37,6 +37,24 @@ def as_blocks(message: dict[str, Any]) -> None:
         message["content"] = [{"type": "text", "text": content}]
 
 
+def _append(out: list[dict[str, Any]], message: dict[str, Any]) -> None:
+    """Append a converted turn, folding it into the previous one when the roles
+    match. The Messages API takes alternating turns; two in a row is a 400."""
+    if not out or out[-1]["role"] != message["role"]:
+        out.append(message)
+        return
+    previous, incoming = out[-1], message["content"]
+    if isinstance(previous["content"], str) and isinstance(incoming, str):
+        previous["content"] = f"{previous['content']}\n\n{incoming}".strip()
+        return
+    as_blocks(previous)
+    if isinstance(previous["content"], list):
+        previous["content"].extend(
+            incoming if isinstance(incoming, list) else [{"type": "text", "text": str(incoming)}])
+    else:                                    # previous turn was empty: take the new one
+        previous["content"] = incoming
+
+
 def mark_cache_breakpoint(message: dict[str, Any]) -> bool:
     """Put a breakpoint on a message's last content block.
 
@@ -77,6 +95,10 @@ class AnthropicTransport(ProviderTransport):
 
         Consecutive tool results are merged into one user turn, which the
         Messages API requires when the assistant emitted parallel tool calls.
+        Consecutive same-role turns are merged for the same reason: the loop is
+        free to produce them — context compression splices a summary in as a user
+        turn, which can land next to the user turn before it — and this is the
+        layer that knows the wire cannot carry them.
         """
         system_parts: list[str] = []
         out: list[dict[str, Any]] = []
@@ -117,10 +139,11 @@ class AnthropicTransport(ProviderTransport):
                         "input": parsed if isinstance(parsed, dict) else {},
                     })
                 # An empty assistant turn is rejected by the API.
-                out.append({"role": "assistant", "content": blocks or [{"type": "text", "text": "..."}]})
+                _append(out, {"role": "assistant",
+                              "content": blocks or [{"type": "text", "text": "..."}]})
 
             else:  # user
-                out.append({"role": "user", "content": str(msg.get("content") or "")})
+                _append(out, {"role": "user", "content": str(msg.get("content") or "")})
 
         return "\n\n".join(p for p in system_parts if p), out
 

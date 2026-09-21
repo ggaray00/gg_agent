@@ -3,15 +3,15 @@
 This is the heart of the whole thing, and it is genuinely small:
 
     while budget remains:
-        assemble request  ->  call model  ->  normalize response
+        fit the window  ->  assemble request  ->  call model  ->  normalize response
         if the model asked for tools:  run them, append results, loop again
         else:                          that text is the answer, stop
 
-Everything else in a production agent (compression, failover, checkpoints,
-approval gates, streaming) hangs off those four phases. hermes-agent splits each
-phase into its own ``agent/turn_*.py`` module and threads a ``_LoopState``
-dataclass through them; the same shape is kept here at one-file scale so the
-seams are visible.
+Everything else in a production agent (failover, checkpoints, approval gates,
+streaming) hangs off those phases — as context compression already does, from
+phase 0 in ``compression.py``. hermes-agent splits each phase into its own
+``agent/turn_*.py`` module and threads a ``_LoopState`` dataclass through them;
+the same shape is kept here at one-file scale so the seams are visible.
 
 Mirrors hermes-agent: agent/conversation_loop.py + agent/turn_*.py + agent/tool_executor.py
 """
@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .compression import PERSISTED_KEY, compress_if_needed, note_real_usage
 from .stream_delivery import StreamDelivery
 from .transports.streaming import StreamInterrupted, is_stream_unsupported
 from .transports.types import NormalizedResponse, Usage
@@ -36,6 +37,31 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_WORKERS = 8          # concurrent tool executions per batch
 MAX_API_RETRIES = 4
+
+# ``PERSISTED_KEY`` marks a message a store has accepted. It lives on the message
+# rather than in an index because compression rewrites the transcript: any
+# "everything before N is safe" bookkeeping is wrong the moment a message is
+# dropped or rewritten in place. Underscore keys never reach a provider (the
+# transports strip them) or a row (``persistence/serialize.py`` only reads the
+# keys it knows). It is defined in ``compression`` because that module has to
+# read it too, and it is this module that imports that one.
+
+
+def mark_persisted(messages: list[dict[str, Any]]) -> None:
+    """Record that the store holds these messages. Also used on resume: every
+    message that came out of the database is durable by definition."""
+    for msg in messages:
+        msg[PERSISTED_KEY] = True
+
+
+def pending_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The not-yet-durable ones, in order. The system prompt is never stored: it
+    is rebuilt each turn, so a copy in the transcript would only go stale."""
+    return [m for m in messages if m.get("role") != "system" and not m.get(PERSISTED_KEY)]
+
+
+def persisted_count(messages: list[dict[str, Any]]) -> int:
+    return sum(1 for m in messages if m.get(PERSISTED_KEY))
 
 
 @dataclass
@@ -59,10 +85,13 @@ class LoopState:
     # Per-iteration slots, rebound by the phases before any later phase reads them.
     api_kwargs: dict[str, Any] | None = None
     response: NormalizedResponse | None = None
-    # Persistence: a callback that makes messages durable, and the index into
-    # ``messages`` of the first one it hasn't accepted yet.
+    # Persistence: a callback that makes messages durable. Which messages are
+    # still owed is read off the messages themselves (see ``PERSISTED_KEY``).
     persist: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None
-    persisted_upto: int = 0
+    # Compression: the uncalibrated size estimate of the request just assembled,
+    # kept so the provider's real ``prompt_tokens`` can correct the estimator.
+    rough_tokens: int = 0
+    compression_exhausted: bool = False
     # Streaming: what the user has been shown, and whether the final answer was
     # among it (so a caller that rendered the deltas doesn't print it twice).
     stream: StreamDelivery | None = None
@@ -251,28 +280,29 @@ async def run_tool_round(agent, s: LoopState, response: NormalizedResponse) -> N
 # ── Persistence ──────────────────────────────────────────────────────────────
 
 async def flush(agent, s: LoopState) -> None:
-    """Hand the not-yet-durable tail of the transcript to ``s.persist``.
+    """Hand every not-yet-durable message to ``s.persist``.
 
     A failure is logged and reported, never raised: losing the transcript is bad,
-    losing the turn as well is worse. ``persisted_upto`` only advances on success,
-    so the same tail is offered again at the next flush point.
+    losing the turn as well is worse. Markers are only set on success, so the same
+    messages are offered again at the next flush point.
 
-    Index-based dedup is sound only because history is append-only. Compression
-    or rewind would need hermes's per-message marker (agent/session_persistence.py).
+    Marker-based rather than index-based because compression rewrites history in
+    place: an index says "everything before here is safe", which stops being true
+    as soon as a message is dropped or rewritten.
     """
-    end = len(s.messages)
-    if s.persist is None or s.persisted_upto >= end:
+    if s.persist is None:
         return
-    pending = [m for m in s.messages[s.persisted_upto:end] if m.get("role") != "system"]
+    pending = pending_messages(s.messages)
+    if not pending:
+        return
     try:
-        if pending:
-            await s.persist(pending)
+        await s.persist(pending)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         agent._persist_error("append", exc, pending=len(pending))
         return
-    s.persisted_upto = end
+    mark_persisted(pending)
 
 
 # ── The loop itself ──────────────────────────────────────────────────────────
@@ -281,12 +311,13 @@ async def run_conversation(agent, user_message: str,
                            conversation_history: list[dict[str, Any]] | None = None,
                            system_prompt: str | None = None,
                            persist: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
-                           persisted_history: int | None = None) -> dict[str, Any]:
+                           ) -> dict[str, Any]:
     """Run one user turn to completion. Returns the result dict the caller keeps.
 
     ``persist`` makes messages durable (the loop knows nothing about stores).
-    ``persisted_history`` says how many of ``conversation_history`` already are —
-    all of them unless an earlier turn's flush failed.
+    Which messages still need it is carried by the messages themselves, so a
+    transcript handed back from an earlier turn — or loaded from a store — needs
+    no separate bookkeeping to pick up where the last flush stopped.
     """
     history_in = conversation_history or []
     messages: list[dict[str, Any]] = []
@@ -296,10 +327,7 @@ async def run_conversation(agent, user_message: str,
     messages.extend(history_in)
     messages.append({"role": "user", "content": user_message})
 
-    offset = 1 if system else 0
-    durable = len(history_in) if persisted_history is None else min(persisted_history, len(history_in))
-    s = LoopState(messages=messages, persist=persist, persisted_upto=offset + durable,
-                  stream=StreamDelivery(agent._emit))
+    s = LoopState(messages=messages, persist=persist, stream=StreamDelivery(agent._emit))
     started = time.time()
 
     while s.api_call_count < agent.max_iterations:
@@ -307,6 +335,10 @@ async def run_conversation(agent, user_message: str,
             s.interrupted, s.exit_reason = True, "interrupted"
             break
 
+        # Before the request is built, not after: a single tool round can push the
+        # transcript past the window, and the next call in this same turn is the
+        # one the provider would reject.
+        await compress_if_needed(agent, s)
         assemble_request(agent, s)
         s.api_call_count += 1
 
@@ -316,6 +348,9 @@ async def run_conversation(agent, user_message: str,
         s.response, s.finish_reason = response, response.finish_reason
         if response.usage:
             s.usage = s.usage + response.usage
+            # What the provider billed for the request just sent, against what it
+            # was estimated to cost: that ratio is the token estimator's calibration.
+            note_real_usage(agent, s.rough_tokens, response.usage.prompt_tokens)
 
         record_assistant_message(s, response)
         # Durable BEFORE any tool runs: a crash mid-round leaves a transcript that
@@ -359,6 +394,7 @@ async def run_conversation(agent, user_message: str,
         # True when ``response`` already reached the event stream as stream_delta events.
         "streamed": s.streamed,
         "exit_reason": s.exit_reason,
-        # How many entries of ``history`` are durable (== len(history) unless a flush failed).
-        "persisted": max(0, s.persisted_upto - offset),
+        # How many entries of ``history`` a store has accepted: len(history) unless
+        # a flush failed, and 0 when persistence is off.
+        "persisted": persisted_count(history),
     }
