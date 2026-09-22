@@ -29,8 +29,12 @@ def get_transport(api_mode: str) -> ProviderTransport:
 
 
 def _register_builtins() -> None:
+    from .bedrock import BedrockConverseTransport
     from .chat_completions import ChatCompletionsTransport
+    from .responses import ResponsesTransport
     register_transport(ChatCompletionsTransport())
+    register_transport(ResponsesTransport())
+    register_transport(BedrockConverseTransport())     # boto3 is imported only when a client is built
     try:
         from .anthropic import AnthropicTransport
     except Exception:  # anthropic SDK not installed — chat_completions still works

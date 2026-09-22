@@ -122,7 +122,7 @@ def make_renderer(verbose: bool, show_reasoning: bool = False):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gg-agent", description="A minimal agentic loop.")
     p.add_argument("prompt", nargs="*", help="Task to run. Omit for an interactive REPL.")
-    p.add_argument("-p", "--provider", help="openai | anthropic | openrouter | groq | deepseek | ollama")
+    p.add_argument("-p", "--provider", help="Provider name or alias (see --list-providers).")
     p.add_argument("-m", "--model", help="Model id (defaults to the provider's default).")
     p.add_argument("-t", "--toolsets", help="Comma-separated toolsets to enable (default: all).")
     p.add_argument("--max-iterations", type=int, default=50)
@@ -133,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print the answer when it is complete instead of as it arrives (or GG_STREAM=0).")
     p.add_argument("--no-prompt-cache", action="store_true",
                    help="Don't mark the prompt for caching (Anthropic; other providers cache anyway).")
+    p.add_argument("-r", "--reasoning", metavar="LEVEL",
+                   help="Reasoning effort: low | medium | high | xhigh | max, or on / off "
+                        "(or GG_REASONING). Unset = the provider's default.")
     p.add_argument("--show-reasoning", action="store_true",
                    help="Stream the model's reasoning to stderr, when it exposes any.")
     p.add_argument("--list-providers", action="store_true", help="Show providers and credential status.")
@@ -335,7 +338,7 @@ def _cmd_auth_status() -> int:
         except Exception as exc:
             status = f"error: {exc}"
         mark = "✓" if profile.has_credentials() else " "
-        print(f"{mark} {profile.name:<12} {status}")
+        print(f"{mark} {profile.name:<24} {status}")
     print("\n✓ = auto-detected. Others still work when named explicitly with -p.", file=sys.stderr)
     return 0
 
@@ -349,22 +352,15 @@ async def _cmd_list_models(provider: str | None) -> int:
     except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if profile.api_mode != "chat_completions":
-        for model in profile.fallback_models or (profile.default_model,):
+    models = await asyncio.to_thread(profile.fetch_models, api_key=api_key or None, base_url=base_url or None)
+    if not models:
+        declared = profile.fallback_models or ((profile.default_model,) if profile.default_model else ())
+        for model in declared:
             print(model)
-        print(f"\n({profile.name} has no catalog endpoint; showing the declared list.)", file=sys.stderr)
-        return 0
-    from .transports import get_transport
-
-    transport = get_transport("chat_completions")
-    client = transport.build_client(api_key=api_key, base_url=base_url, profile=profile)
-    try:
-        models = sorted(m.id for m in (await client.models.list()).data)
-    except Exception as exc:
-        print(f"error: could not list models for {profile.name}: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        await transport.aclose_client(client)
+        why = "catalog unavailable" if models is None else "empty catalog"
+        print(f"\n({profile.name}: {why}; showing the declared list. -v shows why.)", file=sys.stderr)
+        return 0 if declared else 1
+    models = sorted(models) if profile.name != "router" else models     # Router's order is deliberate
     for model in models:
         print(model)
     print(f"\n[{len(models)} models · {profile.name} · {base_url}]", file=sys.stderr)
@@ -392,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_providers:
         for profile in list_providers():
             state = "configured" if profile.has_credentials() else "-"
-            print(f"{profile.name:<12} {profile.api_mode:<20} {state:<12} {profile.default_model}")
+            print(f"{profile.name:<24} {profile.api_mode:<20} {state:<12} {profile.default_model or '(pass -m)'}")
         return 0
 
     if args.list_models:
@@ -445,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             max_depth=args.max_depth,
             event_callback=make_renderer(args.verbose, args.show_reasoning),
             stream=False if args.no_stream else None,
+            reasoning=args.reasoning,
             prompt_caching=not args.no_prompt_cache,
             store=None if wants_persistence and account else False,
             user_id=account["user_id"] if account else None,

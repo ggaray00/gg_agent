@@ -1,0 +1,63 @@
+"""Qwen Portal provider profile."""
+
+from typing import Any
+
+from .. import register_provider
+from ..base import ProviderProfile
+
+
+def _normalize_parts(content: list) -> list | None:
+    """List content -> list-of-dict parts; None when nothing changed (copy-on-write)."""
+    parts, changed = [], False
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "text", "text": part})
+            changed = True
+        elif isinstance(part, dict):
+            if isinstance(part.get("image_url"), dict):
+                part = {**part, "image_url": dict(part["image_url"])}
+                changed = True
+            parts.append(part)
+        else:
+            changed = True
+    return parts if parts and changed else None
+
+
+class QwenProfile(ProviderProfile):
+    """Block-shaped content, a cache marker on the system prompt, hi-res images."""
+
+    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not messages:
+            return []
+        prepared = list(messages)
+        system_idx: int | None = None
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if system_idx is None and msg.get("role") == "system":
+                system_idx = idx
+            content = msg.get("content")
+            if isinstance(content, str):
+                prepared[idx] = {**msg, "content": [{"type": "text", "text": content}]}
+            elif isinstance(content, list):
+                parts = _normalize_parts(content)
+                if parts is not None:
+                    prepared[idx] = {**msg, "content": parts}
+        if system_idx is not None:
+            msg = prepared[system_idx]
+            content = msg.get("content")
+            if isinstance(content, list) and content and isinstance(content[-1], dict):
+                content = list(content)
+                content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+                prepared[system_idx] = {**msg, "content": content}
+        return prepared
+
+    def build_extra_body(self, *, session_id: str | None = None, **ctx: Any) -> dict[str, Any]:
+        return {"vl_high_resolution_images": True}
+
+
+register_provider(QwenProfile(
+    name="qwen-oauth", aliases=("qwen", "qwen-portal", "qwen-cli"), display_name="Qwen Portal",
+    env_vars=("QWEN_API_KEY",), base_url="https://portal.qwen.ai/v1", auth_type="oauth_external",
+    default_max_tokens=65536,
+))

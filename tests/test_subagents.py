@@ -161,10 +161,13 @@ def test_7_chat_completions_build_kwargs_profile_hooks():
     c = ChatCompletionsTransport()
     kw = c.build_kwargs("gpt-4.1", [{"role": "user", "content": "x", "_internal": "drop me"}],
                         tools=[{"name": "f", "description": "d", "parameters": {}}],
-                        profile=get_provider_profile("openrouter"))
+                        profile=get_provider_profile("openrouter"), session_id="s-1",
+                        reasoning_config={"enabled": True, "effort": "high"})
     assert "_internal" not in kw["messages"][0]
     assert kw["tools"][0] == {"type": "function", "function": {"name": "f", "description": "d", "parameters": {}}}
-    assert kw["extra_body"]["provider"]["require_parameters"] is True
+    assert kw["extra_body"]["session_id"] == "s-1", "sticky routing key"
+    assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+    assert "session_id" not in kw and "reasoning_config" not in kw, "hints must not leak onto the wire"
     assert kw["tool_choice"] == "auto"
     ol = c.build_kwargs("q", [{"role": "user", "content": "x"}], profile=get_provider_profile("ollama"))
     assert ol["temperature"] == 0.0 and "tools" not in ol

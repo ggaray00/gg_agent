@@ -114,6 +114,9 @@ def assemble_request(agent, s: LoopState) -> None:
         temperature=agent.temperature,
         max_tokens=agent.max_tokens,
         cache_prompt=agent.prompt_caching,
+        reasoning_config=getattr(agent, "reasoning_config", None),
+        session_id=agent.session_id,
+        base_url=agent.base_url,
     )
 
 

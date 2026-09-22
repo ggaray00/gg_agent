@@ -19,7 +19,7 @@ uv run gg-agent --list-providers --list-tools
 uv run gg-agent --list-models            # live catalog for the active provider
 uv run python example_subagents.py       # delegation, two ways
 
-uv run pytest                            # 107 offline tests, no keys or database needed
+uv run pytest                            # offline tests, no keys or database needed
 uv run ruff check gg_agent/
 ```
 
@@ -29,7 +29,16 @@ Credentials, in the order `gg-agent` looks for them:
 |---|---|
 | **GitHub Copilot** | already signed in via VS Code / Copilot CLI → **nothing to do**; else `uv run gg-agent --login` |
 | anthropic / openai / openrouter / groq / deepseek | `export ANTHROPIC_API_KEY=…` (etc.) |
-| ollama | nothing — `uv run gg-agent -p ollama` |
+| ~40 more API-key providers (xai, gemini, zai, kimi, minimax, fireworks, nebius, …) | their env var — `--list-providers` / `--auth-status` name it; auto-detected after the ones above |
+| openai-codex | a ChatGPT subscription: sign in once with `codex login`, then `-p codex` |
+| bedrock / vertex | the AWS / Google Cloud credential chain (`pip install boto3` / `google-auth`), then `-p bedrock` / `-p vertex` |
+| copilot-acp | the Copilot CLI on `PATH` (`npm install -g @github/copilot`), then `-p copilot-acp` |
+| ollama / custom | nothing — `-p ollama`, or `CUSTOM_BASE_URL=… -p custom` for any OpenAI-compatible server |
+
+Every provider accepts `-r/--reasoning low|medium|high|xhigh|max|off` (or `GG_REASONING`);
+each profile translates it to that provider's own knob (`extra_body.reasoning`,
+`reasoning_effort`, `thinking`, Gemini's `thinking_config`, a Responses `reasoning.effort`…),
+clamped to the levels that model accepts. Unset = the provider's default.
 
 No install step needed for one-off runs — `uv run run.py …` and `uv run python -m gg_agent …`
 work the same way. To add a dependency: `uv add <pkg>`.
@@ -113,12 +122,17 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | gg_agent | what it does | distilled from |
 |---|---|---|
 | `providers/base.py` | `ProviderProfile`: one provider declared once (auth, endpoint, quirks, hooks) | `providers/base.py` |
-| `providers/__init__.py` | registry + 7 built-in profiles | `providers/__init__.py`, `plugins/model-providers/` |
+| `providers/__init__.py` | registry, plugin discovery, auto-detect order | `providers/__init__.py` |
+| `providers/plugins/*.py` | ~50 profiles, one vendor per module (also loads `$GG_HOME/plugins/model-providers/*.py`) | `plugins/model-providers/*` |
+| `providers/copilot_acp_client.py` | Copilot CLI over ACP (stdio JSON-RPC) behind an OpenAI-client face | `agent/copilot_acp_client.py`, `agent/acp_openai_bridge.py` |
+| `reasoning_effort.py` | effort ladder + per-wire vocabularies + `clamp_effort` | `agent/reasoning_effort.py` |
 | `providers/copilot_auth.py` | Copilot OAuth: token discovery, exchange, caching, device login | `hermes_cli/copilot_auth.py` |
 | `transports/types.py` | `ToolCall` / `Usage` / `NormalizedResponse` — the only types the loop sees | `agent/transports/types.py` |
 | `transports/base.py` | `ProviderTransport` ABC: convert → build → call → normalize | `agent/transports/base.py` |
 | `transports/chat_completions.py` | OpenAI + every OpenAI-compatible endpoint | `agent/transports/chat_completions.py` |
-| `transports/anthropic.py` | Messages API: system extraction, `tool_use`/`tool_result` blocks, cache breakpoints | `agent/transports/anthropic.py` + `agent/prompt_caching.py` |
+| `transports/anthropic.py` | Messages API: system extraction, `tool_use`/`tool_result` blocks, cache breakpoints, Bearer auth | `agent/transports/anthropic.py` + `agent/prompt_caching.py` |
+| `transports/responses.py` | Responses API (xAI, Meta, Router, Actual, Codex): input items, `function_call`s, stream-only backends | `agent/transports/codex.py`, `agent/codex_responses_adapter.py` |
+| `transports/bedrock.py` | AWS Bedrock Converse via boto3: `toolUse`/`toolResult`, cache points | `agent/transports/bedrock.py`, `agent/bedrock_adapter.py` |
 | `transports/streaming.py` | `StreamHooks`, tool-call delta reassembly, stream errors | `agent/chat_completion_helpers.py` (`_StreamingCall`, `_ToolCallAccumulator`) |
 | `stream_delivery.py` | what reaches the screen: `<think>` scrubbing, segment breaks, stream events | `agent/stream_delivery.py`, `agent/think_scrubber.py` |
 | `tools/registry.py` | `ToolEntry`, registration, toolset filtering, safe dispatch | `tools/registry.py` + `model_tools.handle_function_call` |
@@ -509,10 +523,14 @@ substring match, backed by the trigram index, for things like paths.
 
 ## Adding things
 
-**A provider** (OpenAI-compatible): one `register_provider(ProviderProfile(...))` call in
-`providers/__init__.py`. Nothing else changes.
+**A provider** (OpenAI-compatible): a new module in `gg_agent/providers/plugins/` (or a
+`.py` in `$GG_HOME/plugins/model-providers/`) with one `register_provider(ProviderProfile(...))`
+call. Nothing else changes. Quirks go in hook overrides: `build_api_kwargs_extras` (reasoning
+knobs), `build_extra_body`, `prepare_messages`, `get_max_tokens`, `resolve_credentials`
+(short-lived tokens), `create_client` (a non-HTTP wire). See `plugins/deepseek.py`,
+`plugins/vertex.py`, `plugins/copilot_acp.py`.
 
-**A protocol** (Gemini native, Bedrock, Responses API): subclass `ProviderTransport`,
+**A protocol** (Gemini native, Vertex Anthropic, …): subclass `ProviderTransport`,
 implement the five methods, `register_transport(...)`. The loop is untouched.
 
 **A tool**: a function plus a `registry.register(...)` call in a new

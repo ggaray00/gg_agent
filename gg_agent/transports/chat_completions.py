@@ -25,11 +25,17 @@ class ChatCompletionsTransport(ProviderTransport):
         return "chat_completions"
 
     def build_client(self, *, api_key: str, base_url: str, profile: Any) -> Any:
+        headers = dict(getattr(profile, "default_headers", {}) or {})
+        # A provider whose wire isn't HTTP (an ACP subprocess) brings its own client.
+        if profile is not None:
+            custom = profile.create_client(api_key=api_key, base_url=base_url, default_headers=headers)
+            if custom is not None:
+                return custom
         from openai import AsyncOpenAI
         return AsyncOpenAI(
             api_key=api_key or "not-needed",     # local servers accept anything
             base_url=base_url or None,
-            default_headers=dict(getattr(profile, "default_headers", {}) or {}) or None,
+            default_headers=headers or None,
             max_retries=0,                        # the loop owns retries
         )
 
@@ -52,11 +58,20 @@ class ChatCompletionsTransport(ProviderTransport):
 
     def build_kwargs(self, model: str, messages: list[dict[str, Any]],
                      tools: list[dict[str, Any]] | None = None, **params) -> dict[str, Any]:
+        """Every provider quirk comes from the profile's fields and hooks.
+
+        ``params`` beyond the SDK's own: ``profile``, ``reasoning_config``
+        ({enabled, effort} or None = provider default), ``session_id`` (sticky
+        routing key) and ``base_url`` (the live endpoint, for hooks that care).
+        """
         profile = params.pop("profile", None)
         # Swallowed, not forwarded: every OpenAI-compatible endpoint caches
         # prefixes on its own with no request parameter, so there is nothing to
         # ask for — and an unknown key here would be a 400.
         params.pop("cache_prompt", None)
+        reasoning_config = params.pop("reasoning_config", None)
+        session_id = params.pop("session_id", None)
+        base_url = params.pop("base_url", None)
         sanitized = self.convert_messages(messages)
         if profile is not None:
             sanitized = profile.prepare_messages(sanitized)
@@ -72,13 +87,21 @@ class ChatCompletionsTransport(ProviderTransport):
         if temperature is not None and temperature is not OMIT_TEMPERATURE:
             api_kwargs["temperature"] = temperature
 
-        max_tokens = params.pop("max_tokens", None) or getattr(profile, "default_max_tokens", None)
+        max_tokens = params.pop("max_tokens", None) or (profile.get_max_tokens(model) if profile else None)
         if max_tokens:
             api_kwargs["max_tokens"] = max_tokens
 
         extra_body = dict(params.pop("extra_body", None) or {})
         if profile is not None:
-            extra_body.update(profile.build_extra_body(model=model))
+            context = {"model": model, "base_url": base_url, "session_id": session_id,
+                       "reasoning_config": reasoning_config}
+            extra_body.update(profile.build_extra_body(**context))
+            # Reasoning fields only go out when the caller asked for reasoning:
+            # without a model catalog, "supported" is the user's say-so.
+            body_extras, top_level = profile.build_api_kwargs_extras(
+                supports_reasoning=reasoning_config is not None, **context)
+            extra_body.update(body_extras)
+            api_kwargs.update(top_level)
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 

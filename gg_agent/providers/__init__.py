@@ -3,28 +3,33 @@
 Every other layer (client construction, model listing, transport selection) reads
 from a ``ProviderProfile`` here instead of keeping parallel data.
 
-In hermes-agent the profiles live as plugins under ``plugins/model-providers/<name>/``
-and are lazily discovered. Here they are declared inline; the registry API is the
-same shape, so swapping in a plugin loader later touches only this file.
+Profiles live one vendor per module under ``providers/plugins/``; each module
+calls ``register_provider()`` at import. User plugins in
+``$GG_HOME/plugins/model-providers/*.py`` load afterwards, so one with the same
+name replaces the built-in (last writer wins).
 
-Mirrors hermes-agent: providers/__init__.py
+Mirrors hermes-agent: providers/__init__.py, plugins/model-providers/
 """
 
 from __future__ import annotations
 
-import time
+import importlib
+import importlib.util
+import logging
+import pkgutil
 from collections.abc import Iterator
 
 from .base import OMIT_TEMPERATURE, ProviderProfile
-from .copilot_auth import (
-    COPILOT_DEFAULT_BASE_URL,
-    copilot_request_headers,
-    exchange_copilot_token,
-    get_copilot_credentials,
-)
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
+
+# Auto-detection order when several providers have credentials. The original
+# providers come first, in the order they always had, so adding a provider never
+# changes which one an existing environment picks; everything else follows by name.
+_DETECT_FIRST = ("anthropic", "copilot", "deepseek", "groq", "openai", "openrouter")
 
 
 def register_provider(profile: ProviderProfile) -> ProviderProfile:
@@ -48,149 +53,48 @@ def list_providers() -> list[ProviderProfile]:
 
 
 def iter_configured() -> Iterator[ProviderProfile]:
-    """Profiles whose credentials are actually present in the environment."""
-    for profile in list_providers():
+    """Profiles whose credentials are actually present, in auto-detect order."""
+    rank = {name: i for i, name in enumerate(_DETECT_FIRST)}
+    for profile in sorted(_REGISTRY.values(), key=lambda p: (rank.get(p.name, len(rank)), p.name)):
         if profile.has_credentials():
             yield profile
 
 
-# ── Built-in profiles ────────────────────────────────────────────────────────
-# Anything OpenAI-compatible only needs a base_url + env var.
+# ── Discovery ────────────────────────────────────────────────────────────────
 
-
-def _token_kind(token: str) -> str:
-    """Token TYPE for display — never any of the secret itself."""
-    for prefix in ("ghu_", "gho_", "ghp_", "github_pat_", "ghs_"):
-        if token.startswith(prefix):
-            return f"{prefix}…"
-    return "opaque token"
-
-
-class CopilotProfile(ProviderProfile):
-    """GitHub Copilot — an OAuth token exchanged for a short-lived API token.
-
-    This is the profile hook system earning its keep: Copilot needs a live
-    credential *and* an account-specific base URL resolved per turn, and none of
-    that leaks into the Agent, the loop or the transport.
-    """
-
-    def resolve_api_key(self) -> str:
+def _discover_builtin() -> None:
+    from . import plugins
+    for info in sorted(pkgutil.iter_modules(plugins.__path__), key=lambda i: i.name):
+        if info.name.startswith("_"):
+            continue
         try:
-            return get_copilot_credentials()[0]
+            importlib.import_module(f"{plugins.__name__}.{info.name}")
         except Exception:
-            return ""
+            logger.warning("provider plugin %s failed to load", info.name, exc_info=True)
 
-    def has_credentials(self) -> bool:
-        """Auto-detect on a COPILOT-SPECIFIC signal only, and never over the network.
 
-        ``GH_TOKEN`` / ``GITHUB_TOKEN`` are usually exported for `gh` or CI, not for
-        Copilot — auto-selecting this provider off one of them would hijack every run
-        on a machine that has a perfectly good OPENAI_API_KEY. Both still work when
-        Copilot is asked for explicitly (``-p copilot``).
-        """
-        import os
-        from pathlib import Path
-
-        from .copilot_auth import _CRED_FILES
-        if os.getenv("COPILOT_GITHUB_TOKEN", "").strip():
-            return True
-        return any(Path(os.path.expanduser(f)).is_file() for f in _CRED_FILES)
-
-    def resolve_credentials(self) -> tuple[str, str]:
-        # Re-read every turn: the exchanged token expires in ~30 minutes, and
-        # enterprise accounts are not on the public base URL.
-        api_token, base_url = get_copilot_credentials()
-        return api_token, base_url or self.base_url
-
-    def credential_status(self) -> str:
-        from .copilot_auth import resolve_github_token
-        token, source = resolve_github_token()
-        if not token:
-            return "no GitHub token found (run `gg-agent login`)"
+def _discover_user() -> None:
+    try:
+        from ..home import get_gg_home
+        folder = get_gg_home() / "plugins" / "model-providers"
+    except Exception:
+        return
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.glob("*.py")):
         try:
-            api_token, expires_at, base_url = exchange_copilot_token(token)
-        except Exception as exc:
-            return f"GitHub token from {source} ({_token_kind(token)}) — exchange failed: {exc}"
-        return (f"GitHub token from {source} ({_token_kind(token)}) → Copilot token valid for "
-                f"{max(int(expires_at - time.time()), 0)}s @ {base_url}")
+            spec = importlib.util.spec_from_file_location(f"gg_user_provider_{path.stem}", path)
+            if spec and spec.loader:
+                spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        except Exception:
+            logger.warning("user provider plugin %s failed to load", path, exc_info=True)
 
 
-class _OpenRouterProfile(ProviderProfile):
-    def build_extra_body(self, **ctx):
-        # OpenRouter-specific routing preferences ride in extra_body.
-        return {"provider": {"require_parameters": True}}
+_discover_builtin()
+_discover_user()
 
-
-register_provider(ProviderProfile(
-    name="openai",
-    display_name="OpenAI",
-    env_vars=("OPENAI_API_KEY",),
-    base_url="https://api.openai.com/v1",
-    default_model="gpt-4.1",
-    fallback_models=("gpt-4.1", "gpt-4.1-mini", "o4-mini"),
-    default_aux_model="gpt-4.1-mini",
-))
-
-register_provider(ProviderProfile(
-    name="anthropic",
-    display_name="Anthropic",
-    api_mode="anthropic_messages",           # <- different transport, same loop
-    env_vars=("ANTHROPIC_API_KEY",),
-    base_url="https://api.anthropic.com",
-    default_model="claude-sonnet-5",
-    fallback_models=("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"),
-    default_max_tokens=8192,                 # Anthropic requires max_tokens
-    default_aux_model="claude-haiku-4-5-20251001",
-))
-
-register_provider(_OpenRouterProfile(
-    name="openrouter",
-    display_name="OpenRouter",
-    env_vars=("OPENROUTER_API_KEY",),
-    base_url="https://openrouter.ai/api/v1",
-    default_model="anthropic/claude-sonnet-5",
-    default_headers={"HTTP-Referer": "https://github.com/", "X-Title": "gg-agent"},
-))
-
-register_provider(ProviderProfile(
-    name="groq",
-    display_name="Groq",
-    env_vars=("GROQ_API_KEY",),
-    base_url="https://api.groq.com/openai/v1",
-    default_model="llama-3.3-70b-versatile",
-))
-
-register_provider(ProviderProfile(
-    name="deepseek",
-    display_name="DeepSeek",
-    env_vars=("DEEPSEEK_API_KEY",),
-    base_url="https://api.deepseek.com/v1",
-    default_model="deepseek-chat",
-))
-
-register_provider(ProviderProfile(
-    name="ollama",
-    display_name="Ollama (local)",
-    env_vars=(),                             # no key needed
-    base_url="http://localhost:11434/v1",
-    default_model="qwen2.5-coder:7b",
-    fixed_temperature=0.0,
-))
-
-register_provider(CopilotProfile(
-    name="copilot",
-    display_name="GitHub Copilot",
-    aliases=("github-copilot", "github", "gh-copilot"),
-    # Copilot speaks the OpenAI Chat Completions shape, so it reuses that transport
-    # unchanged — only auth and headers are special.
-    api_mode="chat_completions",
-    env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
-    base_url=COPILOT_DEFAULT_BASE_URL,
-    default_model="gpt-4.1",
-    fallback_models=("gpt-4.1", "gpt-5", "claude-sonnet-4.5", "o4-mini"),
-    default_headers=copilot_request_headers(),
-    default_aux_model="gpt-4.1-mini",
-))
+from .copilot_auth import get_copilot_credentials  # noqa: E402,F401  (re-export for tests/callers)
+from .plugins.copilot import CopilotProfile  # noqa: E402  (re-export; needs discovery first)
 
 __all__ = [
     "OMIT_TEMPERATURE", "ProviderProfile", "CopilotProfile", "register_provider",

@@ -11,6 +11,11 @@ dependencies = [
     "psycopg[binary,pool]>=3.2",
 ]
 
+[project.optional-dependencies]
+# Only for the providers that need a cloud SDK for auth.
+bedrock = ["boto3>=1.35"]
+vertex = ["google-auth>=2.30", "requests>=2.31"]
+
 [project.scripts]
 gg-agent = "gg_agent.cli:main"
 

@@ -69,6 +69,7 @@ def _build_child(parent_agent, task: dict[str, Any], index: int):
         max_iterations=CHILD_MAX_ITERATIONS,
         max_tokens=parent_agent.max_tokens,
         temperature=parent_agent.temperature,
+        reasoning=getattr(parent_agent, "reasoning_config", None),
         cwd=parent_agent.cwd,
         event_callback=parent_agent.event_callback,
         depth=child_depth,

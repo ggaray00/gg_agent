@@ -78,6 +78,20 @@ class Usage:
             cached_tokens=cached or _field(u, "prompt_cache_hit_tokens"),
         )
 
+    @classmethod
+    def from_responses(cls, u: Any) -> Usage:
+        """Responses API usage: ``input_tokens`` already includes the cached ones."""
+        if u is None:
+            return cls()
+        details = u.get("input_tokens_details") if isinstance(u, dict) else getattr(u, "input_tokens_details", None)
+        prompt, completion = _field(u, "input_tokens"), _field(u, "output_tokens")
+        return cls(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=_field(u, "total_tokens") or prompt + completion,
+            cached_tokens=_field(details, "cached_tokens") if details is not None else 0,
+        )
+
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,

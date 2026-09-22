@@ -11,6 +11,7 @@ Mirrors hermes-agent: agent/transports/anthropic.py
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .base import ProviderTransport
@@ -85,8 +86,27 @@ class AnthropicTransport(ProviderTransport):
         return "anthropic_messages"
 
     def build_client(self, *, api_key: str, base_url: str, profile: Any) -> Any:
+        """x-api-key for Console keys; ``Authorization: Bearer`` for providers that
+        declare ``bearer_auth`` (MiniMax, CommandCode) and for Claude OAuth tokens."""
         from anthropic import AsyncAnthropic
-        return AsyncAnthropic(api_key=api_key, base_url=base_url or None, max_retries=0)
+
+        from ..providers.plugins.anthropic import is_oauth_token
+        headers = {k: v for k, v in (getattr(profile, "default_headers", None) or {}).items() if v}
+        bearer = bool(getattr(profile, "bearer_auth", False))
+        oauth = not bearer and getattr(profile, "name", "") == "anthropic" and is_oauth_token(api_key)
+        if oauth:
+            # Subscription tokens are routed by this beta flag and a Claude Code identity.
+            headers.update({"anthropic-beta": "oauth-2025-04-20", "user-agent": "claude-code/2.0.0 (external, cli)",
+                            "x-app": "cli"})
+        # The SDK appends /v1/messages itself.
+        base_url = re.sub(r"/v1/?$", "", (base_url or "").rstrip("/")) or None
+        if bearer or oauth:
+            client = AsyncAnthropic(auth_token=api_key, base_url=base_url, max_retries=0,
+                                    default_headers=headers or None)
+            # Left unset, the SDK fills api_key from $ANTHROPIC_API_KEY and sends BOTH headers.
+            client.api_key = None
+            return client
+        return AsyncAnthropic(api_key=api_key, base_url=base_url, max_retries=0, default_headers=headers or None)
 
     # ── Conversion ───────────────────────────────────────────────────────
 
@@ -176,6 +196,9 @@ class AnthropicTransport(ProviderTransport):
         """
         profile = params.pop("profile", None)
         cache_prompt = params.pop("cache_prompt", True)
+        # Chat-Completions-side hints with no Messages API counterpart here.
+        for key in ("reasoning_config", "session_id", "base_url"):
+            params.pop(key, None)
         system, converted = self.convert_messages(messages)
 
         api_kwargs: dict[str, Any] = {
@@ -183,7 +206,7 @@ class AnthropicTransport(ProviderTransport):
             "messages": converted,
             # max_tokens is REQUIRED by the Messages API — unlike Chat Completions.
             "max_tokens": params.pop("max_tokens", None)
-                          or getattr(profile, "default_max_tokens", None) or 8192,
+                          or (profile.get_max_tokens(model) if profile is not None else None) or 8192,
         }
         if system:
             api_kwargs["system"] = (

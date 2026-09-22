@@ -481,12 +481,13 @@ async def generate_summary(agent: Any, middle: list[dict[str, Any]],
     budget = _summary_budget(middle)
     prompt = build_summary_prompt(render_for_summary(middle), budget_tokens=budget,
                                   previous_summary=previous)
-    model = agent.profile.default_aux_model or agent.model
+    model = agent.profile.resolve_aux_model() or agent.profile.default_aux_model or agent.model
     started = time.monotonic()
     try:
         kwargs = agent.transport.build_kwargs(
             model=model, messages=[{"role": "user", "content": prompt}], tools=None,
-            profile=agent.profile, max_tokens=budget * 2, cache_prompt=False)
+            profile=agent.profile, max_tokens=budget * 2, cache_prompt=False,
+            session_id=agent.session_id, base_url=agent.base_url)
         raw = agent.transport.call(agent.client, **kwargs)
         if inspect.isawaitable(raw):
             raw = await asyncio.wait_for(raw, SUMMARY_TIMEOUT)

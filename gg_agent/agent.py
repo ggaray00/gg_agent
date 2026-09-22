@@ -32,6 +32,7 @@ from .loop import mark_persisted, run_conversation
 from .persistence import SUBAGENT_SOURCE, SessionStore, get_default_store
 from .prompts import build_system_prompt
 from .providers import ProviderProfile, get_provider_profile, iter_configured
+from .reasoning_effort import parse_reasoning
 from .tools.registry import discover_builtin_tools, registry
 from .transports import get_transport
 
@@ -54,13 +55,16 @@ def resolve_provider(name: str | None = None) -> ProviderProfile:
             raise ValueError(f"Unknown provider {requested!r}")
         return profile
     for profile in iter_configured():
-        if profile.env_vars:          # skip keyless local providers in auto-detect
+        # Only providers keyed by an env var are auto-picked: keyless local servers,
+        # AWS/GCP/ChatGPT logins and CLI subprocesses must be asked for by name.
+        if profile.key_env_vars:
             return profile
     raise RuntimeError(
         "No provider credentials found. Either:\n"
-        "  • export OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / DEEPSEEK_API_KEY\n"
+        "  • export OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY / ... "
+        "(`gg-agent --list-providers` shows all of them)\n"
         "  • use GitHub Copilot: `gg-agent login`, or sign in via VS Code / the Copilot CLI\n"
-        "  • run a local model: provider='ollama'"
+        "  • name one that needs no key: -p ollama | bedrock | vertex | openai-codex | copilot-acp | opencode-free"
     )
 
 
@@ -79,6 +83,11 @@ class Agent:
         max_iterations: int = 50,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        # Reasoning: None = $GG_REASONING, else the provider's own default. A level
+        # ("low" / "medium" / "high" / "xhigh" / "max"), "on", "off", or a ready-made
+        # ``{"enabled": bool, "effort": str}``. Each profile translates it to its
+        # provider's wire shape (see ``gg_agent.reasoning_effort``).
+        reasoning: str | dict | None = None,
         # Prompt caching: mark the stable part of the prompt so the provider can
         # skip re-reading it. Only the Anthropic transport asks for it explicitly
         # (see transports/anthropic.py); every OpenAI-compatible endpoint caches
@@ -124,7 +133,8 @@ class Agent:
 
         self.model = model or self.profile.default_model
         if not self.model:
-            raise ValueError(f"No model given and provider {self.profile.name!r} has no default.")
+            raise ValueError(f"No model given and provider {self.profile.name!r} has no default "
+                             f"(pass one with -m; `gg-agent -p {self.profile.name} --list-models` lists them).")
 
         # Credentials come from the profile hook, not from an env var directly:
         # a provider whose token is minted per session (Copilot) resolves here.
@@ -133,8 +143,11 @@ class Agent:
         self.base_url = base_url or resolved_base_url or self.profile.base_url
         # Explicit values pin the client; only auto-resolved ones get refreshed.
         self._pinned_credentials = bool(api_key and base_url)
-        self.max_tokens = max_tokens or self.profile.default_max_tokens
+        self.max_tokens = max_tokens or self.profile.get_max_tokens(self.model)
         self.temperature = temperature
+        if reasoning is None:
+            reasoning = os.getenv("GG_REASONING") or None
+        self.reasoning_config = reasoning if isinstance(reasoning, dict) else parse_reasoning(reasoning)
         self.prompt_caching = prompt_caching
         if compress is None:
             compress = os.getenv("GG_COMPRESS", "1").strip().lower() not in {"0", "false", "no", "off"}
