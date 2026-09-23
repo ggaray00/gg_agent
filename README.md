@@ -143,6 +143,7 @@ gates, streaming, persistence — hangs off those four phases without changing t
 | `aio.py` | the one sync↔async boundary: a persistent background loop | — |
 | `loop.py` | `run_conversation` + `LoopState` + phases + parallel tool execution | `agent/conversation_loop.py`, `agent/turn_*.py`, `agent/tool_executor.py` |
 | `compression.py` | keeping a long session inside the context window: sizing, thresholds, pruning, summarizing | `agent/context_compressor.py` |
+| `tracing.py` | Langfuse tracing: turn / generation / tool observations, no-op when off | — |
 | `agent.py` | `Agent`: provider resolution, client, tool grant, interrupts, turn facade | `run_agent.AIAgent`, `agent/agent_init.py`, `agent/client_lifecycle.py` |
 | `prompts.py` | main + child system prompts | `agent/prompt_builder.py`, `tools/delegate_tool_progress.py` |
 | `cli.py` | one-shot / REPL front-end, event rendering | `cli.py` |
@@ -518,6 +519,40 @@ Search is keyword-only: a `simple`-config `tsvector` (no stemming, which suits c
 identifiers) queried with `websearch_to_tsquery`, so `"phrases"`, `OR` and `-term` work
 and malformed input never errors. When that finds nothing it falls back to a raw
 substring match, backed by the trigram index, for things like paths.
+
+---
+
+## Tracing (Langfuse)
+
+Opt-in [Langfuse](https://langfuse.com/) tracing: one trace per user turn.
+
+```bash
+uv sync --extra tracing
+export LANGFUSE_PUBLIC_KEY=pk-lf-…  LANGFUSE_SECRET_KEY=sk-lf-…
+export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or https://us.cloud.langfuse.com / self-hosted
+uv run gg-agent "how many python files are here?"
+```
+
+```
+gg-agent  (agent)                   user message → final answer, exit reason, totals
+├─ openai/gpt-4.1  (generation)     full request messages → text + tool calls, token usage
+├─ run_shell  (tool)                args → result (WARNING when it returned {"error": …})
+├─ delegate_task  (tool)
+│   └─ subagent  (agent)            children nest under the tool that spawned them
+├─ compression-summary  (generation)
+└─ openai/gpt-4.1  (generation)
+```
+
+Traces carry the agent's `session_id` and `user_id`, so a REPL conversation groups into
+one Langfuse session; tags are the provider name and the source (`cli`, `subagent`, …).
+Usage is reported with the uncached input split from cache reads/writes so Langfuse's
+cost estimate is right for both OpenAI- and Anthropic-style caching.
+
+With the keys unset, the package missing, or `GG_TRACING=0`, every hook is a no-op and
+`langfuse` is never imported. In code: `Agent(tracing=False)` turns it off for one
+agent, or pass `tracing=gg_agent.tracing.Tracer(langfuse_client)` to use your own client.
+A tracing error is logged and swallowed — it never fails a turn. Pending spans are
+flushed when the root agent closes.
 
 ---
 

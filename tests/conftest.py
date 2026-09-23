@@ -7,3 +7,10 @@ def _no_ambient_database(monkeypatch):
     """The offline suite must not write to a developer's real database just because
     GG_DATABASE_URL is exported in their shell. Tests that want a store pass one."""
     monkeypatch.delenv("GG_DATABASE_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_tracing(monkeypatch):
+    """Same for Langfuse: exported LANGFUSE_* keys must not send test traces.
+    Tests that want tracing pass ``tracing=`` a tracer of their own."""
+    monkeypatch.setenv("GG_TRACING", "0")

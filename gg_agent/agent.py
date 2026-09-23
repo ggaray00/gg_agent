@@ -19,6 +19,7 @@ Mirrors hermes-agent: run_agent.AIAgent + agent/agent_init.py + agent/client_lif
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -34,6 +35,7 @@ from .prompts import build_system_prompt
 from .providers import ProviderProfile, get_provider_profile, iter_configured
 from .reasoning_effort import parse_reasoning
 from .tools.registry import discover_builtin_tools, registry
+from .tracing import resolve_tracer
 from .transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,10 @@ class Agent:
         user_id: str | None = None,
         resume: str | None = None,
         source: str = "cli",
+        # Tracing: None = $LANGFUSE_PUBLIC_KEY/$LANGFUSE_SECRET_KEY decide (and
+        # $GG_TRACING=0 vetoes), False = off, or a ``gg_agent.tracing`` tracer.
+        # Subagents always report into their parent's trace.
+        tracing: Any = None,
         # Delegation lineage — set by the delegate tool, not by users.
         depth: int = 0,
         max_depth: int = 2,
@@ -198,6 +204,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.event_callback = event_callback
         self.depth, self.max_depth, self.parent = depth, max_depth, parent
+        self.tracer = resolve_tracer(tracing, parent)
         if stream is None:
             stream = os.getenv("GG_STREAM", "1").strip().lower() not in {"0", "false", "no", "off"}
         self.streaming = bool(stream) and depth == 0
@@ -435,9 +442,11 @@ class Agent:
             await self._flush_ended_sessions()
             await self._ensure_session()
         await self.refresh_credentials()
-        result = await run_conversation(
-            self, user_message, conversation_history=self.history,
-            persist=self._persist if persisting else None)
+        with self.tracer.turn(self, user_message) as trace:
+            result = await run_conversation(
+                self, user_message, conversation_history=self.history,
+                persist=self._persist if persisting else None)
+            self.tracer.end_turn(trace, self, result)
         if keep_history:
             self.history = result["history"]
         if persisting and self._session_created:
@@ -478,6 +487,9 @@ class Agent:
             await self.transport.aclose_client(self.client)
         except Exception:
             logger.debug("client close failed", exc_info=True)
+        if self.parent is None:
+            # Off the event loop: flush blocks on the exporter's HTTP round-trip.
+            await asyncio.to_thread(self.tracer.flush)
         if self.store is not None and self._store_ready:
             await self._flush_ended_sessions()
             if self._session_created:

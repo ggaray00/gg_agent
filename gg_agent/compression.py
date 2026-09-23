@@ -483,15 +483,20 @@ async def generate_summary(agent: Any, middle: list[dict[str, Any]],
                                   previous_summary=previous)
     model = agent.profile.resolve_aux_model() or agent.profile.default_aux_model or agent.model
     started = time.monotonic()
+    messages = [{"role": "user", "content": prompt}]
     try:
-        kwargs = agent.transport.build_kwargs(
-            model=model, messages=[{"role": "user", "content": prompt}], tools=None,
-            profile=agent.profile, max_tokens=budget * 2, cache_prompt=False,
-            session_id=agent.session_id, base_url=agent.base_url)
-        raw = agent.transport.call(agent.client, **kwargs)
-        if inspect.isawaitable(raw):
-            raw = await asyncio.wait_for(raw, SUMMARY_TIMEOUT)
-        text = (agent.transport.normalize_response(raw).content or "").strip()
+        with agent.tracer.generation(agent, name="compression-summary", model=model,
+                                     messages=messages) as gen:
+            kwargs = agent.transport.build_kwargs(
+                model=model, messages=messages, tools=None,
+                profile=agent.profile, max_tokens=budget * 2, cache_prompt=False,
+                session_id=agent.session_id, base_url=agent.base_url)
+            raw = agent.transport.call(agent.client, **kwargs)
+            if inspect.isawaitable(raw):
+                raw = await asyncio.wait_for(raw, SUMMARY_TIMEOUT)
+            response = agent.transport.normalize_response(raw)
+            agent.tracer.end_generation(gen, agent, response)
+        text = (response.content or "").strip()
     except asyncio.CancelledError:
         raise
     except Exception as exc:

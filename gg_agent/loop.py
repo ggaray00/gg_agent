@@ -261,7 +261,9 @@ async def run_tool_round(agent, s: LoopState, response: NormalizedResponse) -> N
         async with gate:
             agent._emit("tool_start", name=tc.name, args=args)
             started = time.monotonic()
-            result = await agent.registry.dispatch(tc.name, args, agent=agent)
+            with agent.tracer.tool(tc.name, args) as span:
+                result = await agent.registry.dispatch(tc.name, args, agent=agent)
+                agent.tracer.end_tool(span, result)
             agent._emit("tool_end", name=tc.name, result=result,
                         duration=time.monotonic() - started)
             return result
@@ -345,7 +347,10 @@ async def run_conversation(agent, user_message: str,
         assemble_request(agent, s)
         s.api_call_count += 1
 
-        response = await perform_api_call(agent, s)
+        with agent.tracer.generation(agent, messages=s.messages,
+                                     tools=(s.api_kwargs or {}).get("tools")) as gen:
+            response = await perform_api_call(agent, s)
+            agent.tracer.end_generation(gen, agent, response, error=s.final_response)
         if response is None:
             break
         s.response, s.finish_reason = response, response.finish_reason
